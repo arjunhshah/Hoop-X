@@ -63,14 +63,20 @@ DARK_CSS = """
 </style>
 """
 
-# Half court in feet: baseline y=0, midcourt y=47, width ±25 (50 ft).
+# NBA regulation — offensive half (baseline y=0 toward midcourt y=47).
+# Full court 94'×50'; division line at 47'. Key 16'×19'; FT line 19' from baseline (15' from backboard plane).
+# Ref: NBA Official Playing Rules, court diagram.
 COURT_X0, COURT_X1 = -25.0, 25.0
 COURT_Y0, COURT_Y1 = 0.0, 47.0
-HOOP = (0.0, 5.25)
-RIM_R = 0.75
-FT_Y = 19.0
-PAINT_X = 8.0
-THREE_R = 23.75
+HOOP = (0.0, 5.25)  # 5'3" — baseline to center of ring
+RIM_R = 0.75  # 18" diameter rim → 9" radius
+FT_Y = 19.0  # baseline to free-throw line
+PAINT_X = 8.0  # half of 16' lane width
+THREE_R = 23.75  # 23'9" arc from basket center
+THREE_LINE_INSET_FT = 3.0  # 3pt straight segments run 3' inside each sideline
+THREE_JOIN_X = COURT_X1 - THREE_LINE_INSET_FT  # 22 — where arc meets verticals
+RESTRICTED_R_FT = 4.0  # no-charge semicircle
+FT_CIRCLE_R_FT = 6.0
 
 # Canvas / background size (50:47 court aspect; image is scaled to this)
 COURT_IMG_W = 560
@@ -165,20 +171,8 @@ def format_shot_one_line(shot: dict) -> str:
     return f"{res} · {t}"
 
 
-def three_point_arc_points():
-    hx, hy = HOOP
-    xs, ys = [], []
-    for xv in np.linspace(-23.6, 23.6, 140):
-        d = THREE_R**2 - (xv - hx) ** 2
-        if d < 0:
-            continue
-        xs.append(float(xv))
-        ys.append(float(hy + np.sqrt(d)))
-    return xs, ys
-
-
 def build_nba_halfcourt_image(w: int, h: int) -> Image.Image:
-    """NBA-style half court (top view): ~50×47 ft, dark blue floor, baby-blue key, orange rim."""
+    """NBA half court (top view): regulation lane, FT circle, restricted arc, 3pt (arc + corner segments)."""
     floor = (26, 47, 74)
     img = Image.new("RGB", (w, h), floor)
     overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
@@ -189,6 +183,9 @@ def build_nba_halfcourt_image(w: int, h: int) -> Image.Image:
         p0 = feet_to_pixel(x0, y0, w, h)
         p1 = feet_to_pixel(x1, y1, w, h)
         draw.line([p0, p1], fill=fill, width=width)
+
+    hx, hy = HOOP
+    jx = THREE_JOIN_X
 
     # Lane / paint (baby blue)
     lane = [
@@ -214,25 +211,54 @@ def build_nba_halfcourt_image(w: int, h: int) -> Image.Image:
     fline(dr, -PAINT_X, FT_Y, -PAINT_X, COURT_Y0, 3)
     fline(dr, -6, FT_Y, 6, FT_Y, 2, "#1a1a1a")
 
-    t = np.linspace(0, np.pi, 40)
-    pts = [feet_to_pixel(6 * np.cos(ti), FT_Y + 6 * np.sin(ti), w, h) for ti in t]
-    for i in range(len(pts) - 1):
-        dr.line([pts[i], pts[i + 1]], fill="#ffffff", width=3)
+    # Free-throw circle (6' radius), full circle
+    t_ft = np.linspace(0, 2 * np.pi, 72)
+    pts_ft = [
+        feet_to_pixel(
+            FT_CIRCLE_R_FT * np.cos(ti), FT_Y + FT_CIRCLE_R_FT * np.sin(ti), w, h
+        )
+        for ti in t_ft
+    ]
+    for i in range(len(pts_ft) - 1):
+        dr.line([pts_ft[i], pts_ft[i + 1]], fill="#ffffff", width=3)
 
-    t2 = np.linspace(np.pi, 2 * np.pi, 32)
-    pts2 = [feet_to_pixel(4 * np.cos(ti), HOOP[1] + 4 * np.sin(ti), w, h) for ti in t2]
-    for i in range(len(pts2) - 1):
-        dr.line([pts2[i], pts2[i + 1]], fill="#ffffff", width=2)
+    # Restricted area: 4' semicircle opening toward baseline
+    t_rs = np.linspace(np.pi, 2 * np.pi, 36)
+    pts_rs = [
+        feet_to_pixel(
+            RESTRICTED_R_FT * np.cos(ti),
+            hy + RESTRICTED_R_FT * np.sin(ti),
+            w,
+            h,
+        )
+        for ti in t_rs
+    ]
+    for i in range(len(pts_rs) - 1):
+        dr.line([pts_rs[i], pts_rs[i + 1]], fill="#ffffff", width=2)
 
     th = np.linspace(0, 2 * np.pi, 36)
-    pts3 = [feet_to_pixel(HOOP[0] + RIM_R * np.cos(ti), HOOP[1] + RIM_R * np.sin(ti), w, h) for ti in th]
+    pts3 = [
+        feet_to_pixel(
+            hx + RIM_R * np.cos(ti), hy + RIM_R * np.sin(ti), w, h
+        )
+        for ti in th
+    ]
     for i in range(len(pts3) - 1):
         dr.line([pts3[i], pts3[i + 1]], fill="#ff6b2d", width=3)
 
-    ax, ay = three_point_arc_points()
-    if ax:
-        for i in range(len(ax) - 1):
-            fline(dr, ax[i], ay[i], ax[i + 1], ay[i + 1], 3, fill="#ff6b2d")
+    # Three-point line: baseline → vertical (3' inside sideline) → 23'9" arc → vertical → baseline
+    poly_3 = []
+    poly_3.append(feet_to_pixel(COURT_X1, COURT_Y0, w, h))
+    poly_3.append(feet_to_pixel(jx, COURT_Y0, w, h))
+    for xv in np.linspace(jx, -jx, 73):
+        yv = hy + float(np.sqrt(max(0.0, THREE_R**2 - float(xv) ** 2)))
+        poly_3.append(feet_to_pixel(float(xv), yv, w, h))
+    poly_3.append(feet_to_pixel(-jx, COURT_Y0, w, h))
+    poly_3.append(feet_to_pixel(COURT_X0, COURT_Y0, w, h))
+    flat3 = []
+    for px, py in poly_3:
+        flat3.extend([px, py])
+    dr.line(flat3, fill="#ff6b2d", width=3)
 
     fline(dr, COURT_X0, COURT_Y1, COURT_X1, COURT_Y1, 2, "#ffffff")
 
@@ -240,7 +266,7 @@ def build_nba_halfcourt_image(w: int, h: int) -> Image.Image:
         font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", 13)
     except OSError:
         font = ImageFont.load_default()
-    label = "NBA · half court (top)"
+    label = "NBA · regulation half (top view)"
     if hasattr(dr, "textbbox"):
         bbox = dr.textbbox((0, 0), label, font=font)
         tw = bbox[2] - bbox[0]
@@ -251,7 +277,7 @@ def build_nba_halfcourt_image(w: int, h: int) -> Image.Image:
 
 
 # Bump to invalidate @st.cache_data on Streamlit Cloud when court graphics change.
-_COURT_BITMAP_CACHE_VERSION = 2
+_COURT_BITMAP_CACHE_VERSION = 3
 
 
 @st.cache_data(show_spinner=False)

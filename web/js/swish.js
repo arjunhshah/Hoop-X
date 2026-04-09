@@ -12,6 +12,10 @@
   const HOOP_X = 0,
     HOOP_Y = 5.25;
   const THREE_R = 23.75;
+  const THREE_LINE_INSET = 3;
+  const THREE_JOIN_X = 25 - THREE_LINE_INSET;
+  const RESTRICTED_R = 4;
+  const FT_CIRCLE_R = 6;
   const PAINT_X = 8;
   const FT_Y = 19;
   const COURT_W = 560;
@@ -165,7 +169,8 @@
     ctx.fill();
 
     const rimOrange = "#ff6b2d";
-    ctx.strokeStyle = "#e8eef5";
+    const lineWhite = "#e8eef5";
+    ctx.strokeStyle = lineWhite;
     ctx.lineWidth = Math.max(1, w / 280);
     const line = (x0, y0, x1, y1) => {
       const a = feetToPixel(x0, y0, w, h);
@@ -176,30 +181,69 @@
       ctx.stroke();
     };
 
+    line(-25, 0, 25, 0);
+    line(-25, 0, -25, 47);
+    line(25, 0, 25, 47);
+    line(-25, 47, 25, 47);
+
     line(-PAINT_X, COURT_Y0, PAINT_X, COURT_Y0);
     line(PAINT_X, COURT_Y0, PAINT_X, FT_Y);
     line(-PAINT_X, FT_Y, PAINT_X, FT_Y);
     line(-PAINT_X, COURT_Y0, -PAINT_X, FT_Y);
-    line(-25, 47, 25, 47);
+    line(-6, FT_Y, 6, FT_Y);
 
-    ctx.strokeStyle = rimOrange;
-    ctx.lineWidth = Math.max(2, w / 200);
-    line(-3, COURT_Y0, -3, 4);
-    line(3, COURT_Y0, 3, 4);
-
-    const hx = HOOP_X,
-      hy = HOOP_Y;
+    ctx.strokeStyle = lineWhite;
+    ctx.lineWidth = Math.max(2, w / 240);
     ctx.beginPath();
-    for (let i = 0; i <= 120; i++) {
-      const xv = -23.6 + (47.2 * i) / 120;
-      const d = THREE_R * THREE_R - (xv - hx) * (xv - hx);
-      if (d < 0) continue;
-      const yv = hy + Math.sqrt(d);
-      const [px, py] = feetToPixel(xv, yv, w, h);
+    for (let i = 0; i <= 64; i++) {
+      const t = (i / 64) * Math.PI * 2;
+      const [px, py] = feetToPixel(
+        FT_CIRCLE_R * Math.cos(t),
+        FT_Y + FT_CIRCLE_R * Math.sin(t),
+        w,
+        h
+      );
       if (i === 0) ctx.moveTo(px, py);
       else ctx.lineTo(px, py);
     }
+    ctx.closePath();
+    ctx.stroke();
+
+    ctx.lineWidth = Math.max(1.5, w / 300);
+    ctx.beginPath();
+    for (let i = 0; i <= 32; i++) {
+      const t = Math.PI + (i / 32) * Math.PI;
+      const [px, py] = feetToPixel(
+        RESTRICTED_R * Math.cos(t),
+        HOOP_Y + RESTRICTED_R * Math.sin(t),
+        w,
+        h
+      );
+      if (i === 0) ctx.moveTo(px, py);
+      else ctx.lineTo(px, py);
+    }
+    ctx.stroke();
+
+    const hx = HOOP_X,
+      hy = HOOP_Y;
     ctx.strokeStyle = rimOrange;
+    ctx.lineWidth = Math.max(2, w / 200);
+    ctx.beginPath();
+    const jx = THREE_JOIN_X;
+    const [pR0, pR1] = [feetToPixel(25, 0, w, h), feetToPixel(jx, 0, w, h)];
+    ctx.moveTo(pR0[0], pR0[1]);
+    ctx.lineTo(pR1[0], pR1[1]);
+    for (let i = 0; i <= 72; i++) {
+      const xv = jx + (i / 72) * (-2 * jx);
+      const d = THREE_R * THREE_R - xv * xv;
+      if (d < 0) continue;
+      const yv = hy + Math.sqrt(d);
+      const [px, py] = feetToPixel(xv, yv, w, h);
+      ctx.lineTo(px, py);
+    }
+    const [pL1, pL0] = [feetToPixel(-jx, 0, w, h), feetToPixel(-25, 0, w, h)];
+    ctx.lineTo(pL1[0], pL1[1]);
+    ctx.lineTo(pL0[0], pL0[1]);
     ctx.stroke();
 
     const RIM_R_FT = 0.75;
