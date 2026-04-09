@@ -82,9 +82,6 @@ FT_CIRCLE_R_FT = 6.0
 COURT_IMG_W = 560
 COURT_IMG_H = int(round(COURT_IMG_W * (COURT_Y1 - COURT_Y0) / (COURT_X1 - COURT_X0)))
 
-# Home screen sheet cards: compact court + shot markers
-SHEET_CARD_PREVIEW_W = 260
-
 def clamp_court(x: float, y: float):
     return (
         max(COURT_X0, min(COURT_X1, x)),
@@ -734,23 +731,6 @@ def split_shots_for_map(today_shots: list):
     return jump_made, jump_miss, lay_made, lay_miss
 
 
-def sheet_home_thumbnail(shots_for_sheet: list) -> Image.Image:
-    """Small half-court image with today’s shots for sheet picker cards."""
-    jm, jmiss, lm, lmiss = split_shots_for_map(shots_for_sheet)
-    w = SHEET_CARD_PREVIEW_W
-    h = int(round(w * (COURT_Y1 - COURT_Y0) / (COURT_X1 - COURT_X0)))
-    return composite_court_with_shots(
-        get_nba_halfcourt_rgb(w, h),
-        w,
-        h,
-        jm,
-        jmiss,
-        lm,
-        lmiss,
-        None,
-    )
-
-
 def compute_sheet_skills(today_shots: list) -> dict:
     """Rates for this sheet today: jump shots, layups, overall FG."""
     jumps = [s for s in today_shots if s.get("shot_kind") != "layup"]
@@ -962,28 +942,9 @@ def tracker_app():
             )
             _pad_j1, _jump_mid, _pad_j2 = st.columns([1, 2, 1])
             with _jump_mid:
-                st.write("##### Preview")
-                cap = (
-                    "Today on this sheet — green = made, red = miss, gold = pending. "
-                    "Cyan = selected shot (tap a marker)."
-                )
-                st.image(
-                    court_map_img,
-                    use_container_width=True,
-                    caption=cap,
-                )
-                _pbuf = io.BytesIO()
-                court_map_img.save(_pbuf, format="PNG", compress_level=3)
-                st.download_button(
-                    label="Download preview (PNG)",
-                    data=_pbuf.getvalue(),
-                    file_name=f"swish_{active_sheet}_court_preview.png",
-                    mime="image/png",
-                    key=f"dl_jump_preview_{active_sheet}",
-                )
                 st.caption(
-                    "Tap the court below to **place** your next shot, or **tap near a marker** "
-                    "to see which shot it was."
+                    "Tap the court — green = made, red = miss, gold = pending. "
+                    "Tap near a marker to select a shot."
                 )
                 click_dedup = f"_court_click_{active_sheet}"
                 picked = streamlit_image_coordinates(
@@ -1084,34 +1045,6 @@ def tracker_app():
                 merged = merged_layup_from_canvas(
                     canvas_result.json_data, COURT_IMG_W, COURT_IMG_H
                 )
-                draft_path = merged if len(merged) >= 2 else None
-                summary_static = composite_court_with_shots(
-                    get_nba_halfcourt_rgb(COURT_IMG_W, COURT_IMG_H),
-                    COURT_IMG_W,
-                    COURT_IMG_H,
-                    jump_made,
-                    jump_miss,
-                    lay_made,
-                    lay_miss,
-                    None,
-                    inspect_shot=None,
-                    draft_layup_path=draft_path,
-                )
-                st.caption("Shot map preview — saved shots + your current stroke (gold)")
-                st.image(
-                    summary_static,
-                    use_container_width=True,
-                    caption="Green/red = saved layups & jumpers; bright gold/white = route you’re drawing.",
-                )
-                _lbuf = io.BytesIO()
-                summary_static.save(_lbuf, format="PNG", compress_level=3)
-                st.download_button(
-                    label="Download preview (PNG)",
-                    data=_lbuf.getvalue(),
-                    file_name=f"swish_{active_sheet}_layup_preview.png",
-                    mime="image/png",
-                    key=f"dl_lay_preview_{active_sheet}",
-                )
             has_route = len(merged) >= 2 and path_length_feet(merged) >= 1.0
 
             col_a, col_b, col_c = st.columns([1, 1, 1])
@@ -1196,9 +1129,7 @@ def tracker_app():
     c4.metric("Accuracy", f"{pct}%")
 
     st.subheader("Sheets")
-    st.caption(
-        "Preview shows today’s shot map per sheet. Tap a sheet to open your session."
-    )
+    st.caption("Tap a sheet to open your session.")
     sheet_names = list(st.session_state.sheets)
     if not sheet_names:
         st.caption("No sheets — add one in the sidebar.")
@@ -1226,10 +1157,6 @@ def tracker_app():
                             for s in shots_today_list
                             if s.get("session_name") == sheet
                         ]
-                        st.image(
-                            sheet_home_thumbnail(sub_shots),
-                            use_container_width=True,
-                        )
                         exp_label = (
                             f"Which shots ({tot})"
                             if tot
