@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#000000" />
+    <title>Swish — Basketball tracker</title>
+    <link rel="stylesheet" href="css/swish.css" />
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar">
+        <p class="brand">Swish</p>
+        <p class="tagline">Basketball tracker</p>
+        <h2>Sheets</h2>
+        <form class="sheet-form" id="add-sheet-form" action="#" novalidate>
+          <input
+            type="text"
+            id="new-sheet-name"
+            placeholder="New sheet name"
+            autocomplete="off"
+            maxlength="80"
+          />
+          <button type="submit">Add</button>
+        </form>
+        <ul class="sheet-list" id="sheet-list"></ul>
+        <p class="caption" style="margin-top: 1.5rem">
+          Data stays in this browser (localStorage). Use Streamlit
+          <code>swish.py</code> for the full app.
+        </p>
+      </aside>
+      <main>
+        <section id="view-home" class="view active">
+          <h1 class="page-title">Today’s overview</h1>
+          <div class="metrics" id="home-metrics"></div>
+          <h2 class="section-title">Sheets</h2>
+          <p class="caption">
+            Up to nine sheets per page in a 3×3 grid. Use the menu below for more.
+          </p>
+          <div class="sheet-grid-container">
+            <div class="sheet-grid" id="sheet-grid"></div>
+            <div id="sheet-grid-footer" class="sheet-grid-footer hidden">
+              <p class="sheet-grid-hint" id="sheet-grid-hint"></p>
+              <div class="sheet-grid-footer-row">
+                <button
+                  type="button"
+                  class="btn btn-sheet-nav"
+                  id="btn-sheet-prev"
+                  aria-label="Previous page of sheets"
+                >
+                  ‹
+                </button>
+                <div class="sheet-overflow-wrap">
+                  <button
+                    type="button"
+                    class="btn btn-sheet-more"
+                    id="btn-sheet-overflow"
+                    aria-expanded="false"
+                    aria-haspopup="true"
+                    aria-label="All sheets"
+                  >
+                    <span class="sheet-more-dots" aria-hidden="true"
+                      ><span></span><span></span><span></span></span>
+                  </button>
+                  <div
+                    id="sheet-overflow-panel"
+                    class="sheet-overflow-panel hidden"
+                    role="menu"
+                    hidden
+                  ></div>
+                </div>
+                <button
+                  type="button"
+                  class="btn btn-sheet-nav"
+                  id="btn-sheet-next"
+                  aria-label="Next page of sheets"
+                >
+                  ›
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <h2 class="section-title">Recent today (all sheets)</h2>
+          <ul class="shot-list" id="home-recent"></ul>
+          <div class="home-actions">
+            <button
+              type="button"
+              class="btn btn-reset"
+              id="btn-reset-all-today"
+              disabled
+              title="Remove every shot from today on every sheet"
+            >
+              Reset all today
+            </button>
+          </div>
+        </section>
+
+        <section id="view-session" class="view">
+          <div class="session-head">
+            <button type="button" class="btn" id="btn-back">← All sheets</button>
+            <h1 class="page-title" id="session-title">Session</h1>
+          </div>
+          <div class="metrics" id="session-metrics"></div>
+          <p class="session-skills" id="session-skills" aria-live="polite"></p>
+
+          <div class="session-toolbar">
+            <div class="mode-toggle" id="mode-toggle" role="tablist" aria-label="Shot type">
+              <label
+                ><input type="radio" name="mode" value="jump" checked />
+                <span>Jump shot</span></label
+              >
+              <label
+                ><input type="radio" name="mode" value="layup" />
+                <span>Layup</span></label
+              >
+            </div>
+            <div class="toolbar-actions" aria-label="Court actions">
+              <button type="button" class="btn btn-dl" id="btn-download-court">
+                Download PNG
+              </button>
+              <span class="toolbar-sep" aria-hidden="true"></span>
+              <div class="toolbar-group" role="group" aria-label="This sheet today">
+                <button
+                  type="button"
+                  class="btn"
+                  id="btn-undo"
+                  disabled
+                  title="Remove the most recent shot logged today on this sheet"
+                >
+                  Undo last
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-reset"
+                  id="btn-reset"
+                  disabled
+                  title="Delete every shot on this sheet for today"
+                >
+                  Reset sheet today
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div id="jump-panel">
+            <p class="caption">
+              Tap the court to place a mark, then <strong>Made</strong> or
+              <strong>Missed</strong>. Tap near a saved shot to highlight it.
+            </p>
+            <div class="court-wrap">
+              <canvas id="main-court" width="560" height="526"></canvas>
+            </div>
+            <div
+              class="info-banner info-banner--row hidden"
+              id="inspect-banner-wrap"
+              role="status"
+            >
+              <span id="inspect-banner"></span>
+              <button type="button" class="btn btn-small" id="btn-clear-inspect">
+                Clear
+              </button>
+            </div>
+            <div class="actions">
+              <button type="button" class="btn" id="btn-clear-mark">
+                Clear mark
+              </button>
+              <button type="button" class="btn made" id="btn-made" disabled>
+                Made
+              </button>
+              <button type="button" class="btn miss" id="btn-miss" disabled>
+                Missed
+              </button>
+            </div>
+          </div>
+
+          <div id="layup-panel" class="hidden">
+            <p class="caption">
+              Drag to sketch your route (dots show start and end). Then
+              <strong>Made</strong> or <strong>Missed</strong>.
+            </p>
+            <div class="court-wrap">
+              <canvas id="layup-court" width="560" height="526"></canvas>
+            </div>
+            <div class="actions">
+              <button type="button" class="btn" id="btn-clear-layup">
+                Clear drawing
+              </button>
+              <button type="button" class="btn made" id="btn-lay-made" disabled>
+                Made
+              </button>
+              <button type="button" class="btn miss" id="btn-lay-miss" disabled>
+                Missed
+              </button>
+            </div>
+          </div>
+
+          <h2 class="section-title">Recent (this sheet, today)</h2>
+          <ul class="shot-list" id="session-shots"></ul>
+        </section>
+      </main>
+    </div>
+    <script src="js/swish.js"></script>
+  </body>
+</html>
