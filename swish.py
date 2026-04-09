@@ -81,7 +81,7 @@ COURT_IMG_H = int(round(COURT_IMG_W * (COURT_Y1 - COURT_Y0) / (COURT_X1 - COURT_
 # Home screen sheet cards: compact court + shot markers
 SHEET_CARD_PREVIEW_W = 260
 
-# User-supplied half court artwork (3/4 view); falls back to generated diagram if missing.
+# Default half court image (top-down, same as build_nba_halfcourt_image); replace file to customize.
 HALFCOURT_ASSET = Path(__file__).resolve().parent / "assets" / "halfcourt.png"
 
 
