@@ -5,6 +5,8 @@ import datetime
 import io
 import json
 import re
+from functools import lru_cache
+
 import streamlit as st
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -287,8 +289,22 @@ def _nba_halfcourt_png_bytes(width: int, height: int, _cache_v: int) -> bytes:
     return buf.getvalue()
 
 
+@lru_cache(maxsize=4)
+def _base_court_rgb_cached(_cache_v: int) -> Image.Image:
+    """Decode PNG once per process; `composite_court_with_shots` always `.copy()`s before drawing."""
+    return Image.open(
+        io.BytesIO(
+            _nba_halfcourt_png_bytes(COURT_IMG_W, COURT_IMG_H, _cache_v)
+        )
+    ).convert("RGB")
+
+
 def get_nba_halfcourt_rgb(width: int, height: int) -> Image.Image:
     """Half court bitmap: programmatic top-down NBA half court."""
+    if width == COURT_IMG_W and height == COURT_IMG_H:
+        # Shared RGB (composite_court_with_shots copies before drawing). Callers that
+        # pass the image to components should use .copy() if the component might mutate.
+        return _base_court_rgb_cached(_COURT_BITMAP_CACHE_VERSION)
     return Image.open(
         io.BytesIO(
             _nba_halfcourt_png_bytes(width, height, _COURT_BITMAP_CACHE_VERSION)
@@ -759,11 +775,17 @@ def compute_sheet_skills(today_shots: list) -> dict:
     }
 
 
-def render_skills_chart(skills: dict) -> None:
-    """Bar chart of jump %, layup %, overall FG (today, this sheet)."""
-    jp = skills["jump_pct"]
-    lp = skills["layup_pct"]
-    fg = skills["fg_pct"]
+@st.cache_data(show_spinner=False)
+def _skills_bar_chart_png(jk: float, lk: float, fk: float) -> bytes:
+    """Cached matplotlib render (jump/layup/FG use -1.0 when rate is undefined)."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    jp = None if jk < -0.5 else jk
+    lp = None if lk < -0.5 else lk
+    fg = None if fk < -0.5 else fk
     raw = [jp, lp, fg]
     vals = [
         jp if jp is not None else 0.0,
@@ -771,49 +793,64 @@ def render_skills_chart(skills: dict) -> None:
         fg if fg is not None else 0.0,
     ]
     labels = ["Jump shot", "Layup", "Overall FG"]
+    fig, ax = plt.subplots(figsize=(5.2, 3.5))
+    fig.patch.set_facecolor("#0d0d0d")
+    ax.set_facecolor("#111111")
+    x = np.arange(len(labels), dtype=float)
+    bar_w = 0.62
+    colors = ["#4ade80", "#60a5fa", "#fbbf24"]
+    bars = ax.bar(x, vals, bar_w, color=colors, edgecolor="#2a2a2a", linewidth=1)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, color="#d4d4d4", fontsize=10)
+    ax.set_ylabel("Field goal %", color="#a3a3a3", fontsize=10)
+    ax.set_ylim(0, 100)
+    ax.set_yticks([0, 25, 50, 75, 100])
+    ax.tick_params(axis="y", colors="#888888", labelsize=8)
+    ax.grid(axis="y", color="#2a2a2a", linestyle="-", linewidth=0.6, alpha=0.95)
+    ax.set_axisbelow(True)
+    for spine in ax.spines.values():
+        spine.set_color("#333333")
+    ax.set_title("Skills — today on this sheet", color="#e5e5e5", fontsize=11, pad=10)
+    for b, v, r in zip(bars, vals, raw):
+        h = b.get_height()
+        txt = "—" if r is None and v == 0.0 else f"{v:.0f}%"
+        ax.annotate(
+            txt,
+            xy=(b.get_x() + b.get_width() / 2, h),
+            xytext=(0, 3),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            color="#e5e5e5",
+            fontsize=9,
+        )
+    plt.tight_layout()
+    out = io.BytesIO()
+    fig.savefig(out, format="png", dpi=120, facecolor="#0d0d0d", bbox_inches="tight")
+    plt.close(fig)
+    return out.getvalue()
+
+
+def render_skills_chart(skills: dict) -> None:
+    """Bar chart of jump %, layup %, overall FG (today, this sheet)."""
+
+    def _key(x: float | None) -> float:
+        return -1.0 if x is None else float(x)
+
+    jk = _key(skills["jump_pct"])
+    lk = _key(skills["layup_pct"])
+    fk = _key(skills["fg_pct"])
+    raw = [skills["jump_pct"], skills["layup_pct"], skills["fg_pct"]]
+    vals = [
+        skills["jump_pct"] if skills["jump_pct"] is not None else 0.0,
+        skills["layup_pct"] if skills["layup_pct"] is not None else 0.0,
+        skills["fg_pct"] if skills["fg_pct"] is not None else 0.0,
+    ]
+    labels = ["Jump shot", "Layup", "Overall FG"]
     try:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-
-        fig, ax = plt.subplots(figsize=(5.2, 3.5))
-        fig.patch.set_facecolor("#0d0d0d")
-        ax.set_facecolor("#111111")
-        x = np.arange(len(labels), dtype=float)
-        bar_w = 0.62
-        colors = ["#4ade80", "#60a5fa", "#fbbf24"]
-        bars = ax.bar(x, vals, bar_w, color=colors, edgecolor="#2a2a2a", linewidth=1)
-        ax.set_xticks(x)
-        ax.set_xticklabels(labels, color="#d4d4d4", fontsize=10)
-        ax.set_ylabel("Field goal %", color="#a3a3a3", fontsize=10)
-        ax.set_ylim(0, 100)
-        ax.set_yticks([0, 25, 50, 75, 100])
-        ax.tick_params(axis="y", colors="#888888", labelsize=8)
-        ax.grid(axis="y", color="#2a2a2a", linestyle="-", linewidth=0.6, alpha=0.95)
-        ax.set_axisbelow(True)
-        for spine in ax.spines.values():
-            spine.set_color("#333333")
-        ax.set_title("Skills — today on this sheet", color="#e5e5e5", fontsize=11, pad=10)
-        for b, v, r in zip(bars, vals, raw):
-            h = b.get_height()
-            if r is None and v == 0.0:
-                txt = "—"
-            else:
-                txt = f"{v:.0f}%"
-            ax.annotate(
-                txt,
-                xy=(b.get_x() + b.get_width() / 2, h),
-                xytext=(0, 3),
-                textcoords="offset points",
-                ha="center",
-                va="bottom",
-                color="#e5e5e5",
-                fontsize=9,
-            )
-        plt.tight_layout()
-        st.pyplot(fig, clear_figure=True, use_container_width=True)
-    except ImportError:
+        buf = _skills_bar_chart_png(jk, lk, fk)
+        st.image(io.BytesIO(buf), use_container_width=True)
+    except Exception:
         cj, cl, co = st.columns(3)
         for col, lab, v, r in (
             (cj, labels[0], vals[0], raw[0]),
@@ -824,6 +861,257 @@ def render_skills_chart(skills: dict) -> None:
                 lab,
                 f"{v:.0f}%" if r is not None or v > 0 else "—",
             )
+
+
+def _render_active_session(active_sheet: str) -> None:
+    base44 = get_base44()
+    all_shots = base44.list_shots()
+    st.subheader(f"Session · {active_sheet}")
+
+    today_shots = [
+        s
+        for s in all_shots
+        if s["created_date"].date().isoformat() == today_iso()
+        and s.get("session_name") == active_sheet
+    ]
+
+    shot_mode = st.radio(
+        "Shot type",
+        ["Jump shot", "Layup"],
+        horizontal=True,
+        key="shot_mode_session",
+    )
+    prev_mode = st.session_state.get("_last_shot_mode")
+    if prev_mode is not None and prev_mode != shot_mode:
+        st.session_state.pending_shot = None
+        st.session_state.court_inspect_id = None
+        st.session_state.layup_canvas_key = int(st.session_state.layup_canvas_key) + 1
+    st.session_state._last_shot_mode = shot_mode
+
+    made = sum(1 for s in today_shots if s["result"] == "made")
+    missed = sum(1 for s in today_shots if s["result"] == "missed")
+    skills = compute_sheet_skills(today_shots)
+
+    st.write("##### This sheet today")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Made", made)
+    m2.metric("Missed", missed)
+    fg_label = f"{skills['fg_pct']:.1f}%" if skills["fg_pct"] is not None else "—"
+    m3.metric("FG%", fg_label)
+
+    st.write("##### Skills")
+    sk_l, sk_r = st.columns([1.15, 1])
+    with sk_l:
+        render_skills_chart(skills)
+    with sk_r:
+        st.caption(
+            "Jump vs layup vs overall field-goal rate on **this sheet** (today)."
+        )
+        st.caption(
+            f"Jump shots: **{skills['jump_made']}** / {skills['jump_total']} · "
+            f"Layups: **{skills['layup_made']}** / {skills['layup_total']} · "
+            f"Shots: **{skills['total']}**"
+        )
+
+    jump_made, jump_miss, lay_made, lay_miss = split_shots_for_map(today_shots)
+    pending = st.session_state.pending_shot
+    if pending is not None:
+        pending = (float(pending[0]), float(pending[1]))
+
+    inspect_id = st.session_state.get("court_inspect_id")
+    inspect_shot = None
+    if inspect_id is not None:
+        inspect_shot = next(
+            (s for s in today_shots if s.get("id") == inspect_id), None
+        )
+
+    if shot_mode == "Jump shot":
+        court_map_img = composite_court_with_shots(
+            get_nba_halfcourt_rgb(COURT_IMG_W, COURT_IMG_H),
+            COURT_IMG_W,
+            COURT_IMG_H,
+            jump_made,
+            jump_miss,
+            lay_made,
+            lay_miss,
+            pending,
+            inspect_shot=inspect_shot,
+        )
+        _pad_j1, _jump_mid, _pad_j2 = st.columns([1, 2, 1])
+        with _jump_mid:
+            st.caption(
+                "Tap the court — green = made, red = miss, gold = pending. "
+                "Tap near a marker to select a shot."
+            )
+            click_dedup = f"_court_click_{active_sheet}"
+            picked = streamlit_image_coordinates(
+                court_map_img,
+                width=COURT_IMG_W,
+                height=COURT_IMG_H,
+                key=f"jump_img_{active_sheet}",
+            )
+            if picked is not None:
+                txy = (int(picked["x"]), int(picked["y"]))
+                if st.session_state.get(click_dedup) != txy:
+                    st.session_state[click_dedup] = txy
+                    cx, cy = pixel_to_court(
+                        float(txy[0]), float(txy[1]), COURT_IMG_W, COURT_IMG_H
+                    )
+                    hit = find_shot_near_court_click(today_shots, cx, cy)
+                    if hit is not None:
+                        st.session_state.court_inspect_id = hit["id"]
+                        st.session_state.pending_shot = None
+                    else:
+                        st.session_state.court_inspect_id = None
+                        st.session_state.pending_shot = (cx, cy)
+                    st.rerun()
+
+        if inspect_shot is not None:
+            st.info(f"**Selected shot** · {format_shot_one_line(inspect_shot)}")
+            if st.button("Clear selection", key=f"clear_inspect_{active_sheet}"):
+                st.session_state.court_inspect_id = None
+                st.rerun()
+
+        col_a, col_b, col_c = st.columns([1, 1, 1])
+        has_mark = st.session_state.pending_shot is not None
+        if col_a.button("Clear mark", type="secondary"):
+            st.session_state.pending_shot = None
+            st.session_state.court_inspect_id = None
+            st.session_state.pop(f"_court_click_{active_sheet}", None)
+            st.rerun()
+
+        log_made = col_b.button("Made", type="primary", disabled=not has_mark)
+        log_miss = col_c.button("Missed", type="secondary", disabled=not has_mark)
+
+        if log_made and has_mark:
+            x, y = st.session_state.pending_shot
+            base44.create_shot(
+                {
+                    "result": "made",
+                    "drill": "halfcourt",
+                    "shot_kind": "jump",
+                    "session_name": active_sheet,
+                    "player_name": "",
+                    "session_type": "halfcourt",
+                    "court_x": x,
+                    "court_y": y,
+                }
+            )
+            st.session_state.pending_shot = None
+            st.session_state.pop(f"_court_click_{active_sheet}", None)
+            st.rerun()
+        if log_miss and has_mark:
+            x, y = st.session_state.pending_shot
+            base44.create_shot(
+                {
+                    "result": "missed",
+                    "drill": "halfcourt",
+                    "shot_kind": "jump",
+                    "session_name": active_sheet,
+                    "player_name": "",
+                    "session_type": "halfcourt",
+                    "court_x": x,
+                    "court_y": y,
+                }
+            )
+            st.session_state.pending_shot = None
+            st.session_state.pop(f"_court_click_{active_sheet}", None)
+            st.rerun()
+
+    else:
+        st.caption(
+            "Draw your layup route on the court (drag to sketch your drive). "
+            "Then tap **Made** or **Missed** — the stroke is read when you click "
+            "(no live redraw while drawing, for speed)."
+        )
+        court_bg = get_nba_halfcourt_rgb(COURT_IMG_W, COURT_IMG_H).copy()
+        ckey = int(st.session_state.layup_canvas_key)
+        _pad_l, _court_col, _pad_r = st.columns([1, 2, 1])
+        with _court_col:
+            canvas_result = st_canvas(
+                fill_color="rgba(0, 0, 0, 0)",
+                stroke_width=4,
+                stroke_color="#f4d03f",
+                background_image=court_bg,
+                update_streamlit=False,
+                height=COURT_IMG_H,
+                width=COURT_IMG_W,
+                drawing_mode="freedraw",
+                key=f"layup_canvas_{active_sheet}_{ckey}",
+                display_toolbar=True,
+            )
+            merged = merged_layup_from_canvas(
+                canvas_result.json_data, COURT_IMG_W, COURT_IMG_H
+            )
+        has_route = len(merged) >= 2 and path_length_feet(merged) >= 1.0
+
+        col_a, col_b, col_c = st.columns([1, 1, 1])
+        if col_a.button("Clear layup drawing", type="secondary"):
+            st.session_state.layup_canvas_key = ckey + 1
+            st.rerun()
+
+        log_made = col_b.button("Made", type="primary", disabled=not has_route)
+        log_miss = col_c.button("Missed", type="secondary", disabled=not has_route)
+
+        lx, ly = merged[-1] if merged else (None, None)
+        if log_made and has_route:
+            base44.create_shot(
+                {
+                    "result": "made",
+                    "drill": "layup",
+                    "shot_kind": "layup",
+                    "session_name": active_sheet,
+                    "player_name": "",
+                    "session_type": "halfcourt",
+                    "layup_path": [[float(a), float(b)] for a, b in merged],
+                    "court_x": float(lx) if lx is not None else None,
+                    "court_y": float(ly) if ly is not None else None,
+                }
+            )
+            st.session_state.layup_canvas_key = ckey + 1
+            st.rerun()
+        if log_miss and has_route:
+            base44.create_shot(
+                {
+                    "result": "missed",
+                    "drill": "layup",
+                    "shot_kind": "layup",
+                    "session_name": active_sheet,
+                    "player_name": "",
+                    "session_type": "halfcourt",
+                    "layup_path": [[float(a), float(b)] for a, b in merged],
+                    "court_x": float(lx) if lx is not None else None,
+                    "court_y": float(ly) if ly is not None else None,
+                }
+            )
+            st.session_state.layup_canvas_key = ckey + 1
+            st.rerun()
+
+    u1, u2 = st.columns(2)
+    if u1.button("Undo last on this sheet", disabled=not today_shots):
+        base44.delete_shot(today_shots[0]["id"])
+        st.rerun()
+    if u2.button("Reset this sheet (today)", disabled=not today_shots):
+        for s in list(today_shots):
+            base44.delete_shot(s["id"])
+        st.rerun()
+
+    st.write("##### Recent on this sheet")
+    for shot in today_shots[:8]:
+        if shot.get("shot_kind") == "layup":
+            path = shot.get("layup_path") or []
+            loc = f"layup · {len(path)} pts"
+        else:
+            cx = shot.get("court_x")
+            cy = shot.get("court_y")
+            loc = f" @ ({cx:.1f}, {cy:.1f} ft)" if cx is not None and cy is not None else ""
+        st.write(
+            f"- [{shot['result'].upper()}] {loc} · {shot['created_date'].strftime('%H:%M:%S')}"
+        )
+
+
+if hasattr(st, "fragment"):
+    _render_active_session = st.fragment(_render_active_session)
 
 
 def tracker_app():
@@ -889,247 +1177,7 @@ def tracker_app():
             st.session_state._last_active_sheet = None
             st.rerun()
 
-        st.subheader(f"Session · {active_sheet}")
-
-        today_shots = [
-            s
-            for s in all_shots
-            if s["created_date"].date().isoformat() == today_iso()
-            and s.get("session_name") == active_sheet
-        ]
-
-        shot_mode = st.radio(
-            "Shot type",
-            ["Jump shot", "Layup"],
-            horizontal=True,
-            key="shot_mode_session",
-        )
-        prev_mode = st.session_state.get("_last_shot_mode")
-        if prev_mode is not None and prev_mode != shot_mode:
-            st.session_state.pending_shot = None
-            st.session_state.court_inspect_id = None
-            st.session_state.layup_canvas_key = int(st.session_state.layup_canvas_key) + 1
-        st.session_state._last_shot_mode = shot_mode
-
-        made = sum(1 for s in today_shots if s["result"] == "made")
-        missed = sum(1 for s in today_shots if s["result"] == "missed")
-        skills = compute_sheet_skills(today_shots)
-
-        st.write("##### This sheet today")
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Made", made)
-        m2.metric("Missed", missed)
-        fg_label = f"{skills['fg_pct']:.1f}%" if skills["fg_pct"] is not None else "—"
-        m3.metric("FG%", fg_label)
-
-        st.write("##### Skills")
-        sk_l, sk_r = st.columns([1.15, 1])
-        with sk_l:
-            render_skills_chart(skills)
-        with sk_r:
-            st.caption(
-                "Jump vs layup vs overall field-goal rate on **this sheet** (today)."
-            )
-            st.caption(
-                f"Jump shots: **{skills['jump_made']}** / {skills['jump_total']} · "
-                f"Layups: **{skills['layup_made']}** / {skills['layup_total']} · "
-                f"Shots: **{skills['total']}**"
-            )
-
-        jump_made, jump_miss, lay_made, lay_miss = split_shots_for_map(today_shots)
-        pending = st.session_state.pending_shot
-        if pending is not None:
-            pending = (float(pending[0]), float(pending[1]))
-
-        inspect_id = st.session_state.get("court_inspect_id")
-        inspect_shot = None
-        if inspect_id is not None:
-            inspect_shot = next(
-                (s for s in today_shots if s.get("id") == inspect_id), None
-            )
-
-        if shot_mode == "Jump shot":
-            court_map_img = composite_court_with_shots(
-                get_nba_halfcourt_rgb(COURT_IMG_W, COURT_IMG_H),
-                COURT_IMG_W,
-                COURT_IMG_H,
-                jump_made,
-                jump_miss,
-                lay_made,
-                lay_miss,
-                pending,
-                inspect_shot=inspect_shot,
-            )
-            _pad_j1, _jump_mid, _pad_j2 = st.columns([1, 2, 1])
-            with _jump_mid:
-                st.caption(
-                    "Tap the court — green = made, red = miss, gold = pending. "
-                    "Tap near a marker to select a shot."
-                )
-                click_dedup = f"_court_click_{active_sheet}"
-                picked = streamlit_image_coordinates(
-                    court_map_img,
-                    width=COURT_IMG_W,
-                    height=COURT_IMG_H,
-                    key=f"jump_img_{active_sheet}",
-                )
-                if picked is not None:
-                    txy = (int(picked["x"]), int(picked["y"]))
-                    if st.session_state.get(click_dedup) != txy:
-                        st.session_state[click_dedup] = txy
-                        cx, cy = pixel_to_court(
-                            float(txy[0]), float(txy[1]), COURT_IMG_W, COURT_IMG_H
-                        )
-                        hit = find_shot_near_court_click(today_shots, cx, cy)
-                        if hit is not None:
-                            st.session_state.court_inspect_id = hit["id"]
-                            st.session_state.pending_shot = None
-                        else:
-                            st.session_state.court_inspect_id = None
-                            st.session_state.pending_shot = (cx, cy)
-                        st.rerun()
-
-            if inspect_shot is not None:
-                st.info(f"**Selected shot** · {format_shot_one_line(inspect_shot)}")
-                if st.button("Clear selection", key=f"clear_inspect_{active_sheet}"):
-                    st.session_state.court_inspect_id = None
-                    st.rerun()
-
-            col_a, col_b, col_c = st.columns([1, 1, 1])
-            has_mark = st.session_state.pending_shot is not None
-            if col_a.button("Clear mark", type="secondary"):
-                st.session_state.pending_shot = None
-                st.session_state.court_inspect_id = None
-                st.session_state.pop(f"_court_click_{active_sheet}", None)
-                st.rerun()
-
-            log_made = col_b.button("Made", type="primary", disabled=not has_mark)
-            log_miss = col_c.button("Missed", type="secondary", disabled=not has_mark)
-
-            if log_made and has_mark:
-                x, y = st.session_state.pending_shot
-                base44.create_shot(
-                    {
-                        "result": "made",
-                        "drill": "halfcourt",
-                        "shot_kind": "jump",
-                        "session_name": active_sheet,
-                        "player_name": "",
-                        "session_type": "halfcourt",
-                        "court_x": x,
-                        "court_y": y,
-                    }
-                )
-                st.session_state.pending_shot = None
-                st.session_state.pop(f"_court_click_{active_sheet}", None)
-                st.rerun()
-            if log_miss and has_mark:
-                x, y = st.session_state.pending_shot
-                base44.create_shot(
-                    {
-                        "result": "missed",
-                        "drill": "halfcourt",
-                        "shot_kind": "jump",
-                        "session_name": active_sheet,
-                        "player_name": "",
-                        "session_type": "halfcourt",
-                        "court_x": x,
-                        "court_y": y,
-                    }
-                )
-                st.session_state.pending_shot = None
-                st.session_state.pop(f"_court_click_{active_sheet}", None)
-                st.rerun()
-
-        else:
-            st.caption(
-                "Draw your layup route on the court (drag to sketch your drive). "
-                "Then tap **Made** or **Missed** to save it."
-            )
-            court_bg = get_nba_halfcourt_rgb(COURT_IMG_W, COURT_IMG_H)
-            ckey = int(st.session_state.layup_canvas_key)
-            _pad_l, _court_col, _pad_r = st.columns([1, 2, 1])
-            with _court_col:
-                canvas_result = st_canvas(
-                    fill_color="rgba(0, 0, 0, 0)",
-                    stroke_width=4,
-                    stroke_color="#f4d03f",
-                    background_image=court_bg,
-                    update_streamlit=True,
-                    height=COURT_IMG_H,
-                    width=COURT_IMG_W,
-                    drawing_mode="freedraw",
-                    key=f"layup_canvas_{active_sheet}_{ckey}",
-                    display_toolbar=True,
-                )
-                merged = merged_layup_from_canvas(
-                    canvas_result.json_data, COURT_IMG_W, COURT_IMG_H
-                )
-            has_route = len(merged) >= 2 and path_length_feet(merged) >= 1.0
-
-            col_a, col_b, col_c = st.columns([1, 1, 1])
-            if col_a.button("Clear layup drawing", type="secondary"):
-                st.session_state.layup_canvas_key = ckey + 1
-                st.rerun()
-
-            log_made = col_b.button("Made", type="primary", disabled=not has_route)
-            log_miss = col_c.button("Missed", type="secondary", disabled=not has_route)
-
-            lx, ly = merged[-1] if merged else (None, None)
-            if log_made and has_route:
-                base44.create_shot(
-                    {
-                        "result": "made",
-                        "drill": "layup",
-                        "shot_kind": "layup",
-                        "session_name": active_sheet,
-                        "player_name": "",
-                        "session_type": "halfcourt",
-                        "layup_path": [[float(a), float(b)] for a, b in merged],
-                        "court_x": float(lx) if lx is not None else None,
-                        "court_y": float(ly) if ly is not None else None,
-                    }
-                )
-                st.session_state.layup_canvas_key = ckey + 1
-                st.rerun()
-            if log_miss and has_route:
-                base44.create_shot(
-                    {
-                        "result": "missed",
-                        "drill": "layup",
-                        "shot_kind": "layup",
-                        "session_name": active_sheet,
-                        "player_name": "",
-                        "session_type": "halfcourt",
-                        "layup_path": [[float(a), float(b)] for a, b in merged],
-                        "court_x": float(lx) if lx is not None else None,
-                        "court_y": float(ly) if ly is not None else None,
-                    }
-                )
-                st.session_state.layup_canvas_key = ckey + 1
-                st.rerun()
-
-        u1, u2 = st.columns(2)
-        if u1.button("Undo last on this sheet", disabled=not today_shots):
-            base44.delete_shot(today_shots[0]["id"])
-            st.rerun()
-        if u2.button("Reset this sheet (today)", disabled=not today_shots):
-            for s in list(today_shots):
-                base44.delete_shot(s["id"])
-            st.rerun()
-
-        st.write("##### Recent on this sheet")
-        for shot in today_shots[:8]:
-            if shot.get("shot_kind") == "layup":
-                path = shot.get("layup_path") or []
-                loc = f"layup · {len(path)} pts"
-            else:
-                cx = shot.get("court_x")
-                cy = shot.get("court_y")
-                loc = f" @ ({cx:.1f}, {cy:.1f} ft)" if cx is not None and cy is not None else ""
-            st.write(
-                f"- [{shot['result'].upper()}] {loc} · {shot['created_date'].strftime('%H:%M:%S')}"
-            )
+        _render_active_session(active_sheet)
         return
 
     st.session_state._last_active_sheet = None
