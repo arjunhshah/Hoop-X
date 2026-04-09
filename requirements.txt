@@ -1,0 +1,6 @@
+# Streamlit app (swish.py) — Streamlit Community Cloud & local dev
+streamlit>=1.31.0
+numpy>=1.26.0
+Pillow>=10.2.0
+streamlit-drawable-canvas>=0.9.3
+streamlit-image-coordinates>=0.1.6
