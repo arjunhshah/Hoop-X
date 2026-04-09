@@ -2,14 +2,12 @@
 from __future__ import annotations
 
 import datetime
-import hashlib
 import io
 import json
 import re
-from pathlib import Path
 import streamlit as st
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFont
 from streamlit_drawable_canvas import st_canvas
 from streamlit_image_coordinates import streamlit_image_coordinates
 
@@ -80,10 +78,6 @@ COURT_IMG_H = int(round(COURT_IMG_W * (COURT_Y1 - COURT_Y0) / (COURT_X1 - COURT_
 
 # Home screen sheet cards: compact court + shot markers
 SHEET_CARD_PREVIEW_W = 260
-
-# Default half court image (top-down, same as build_nba_halfcourt_image); replace file to customize.
-HALFCOURT_ASSET = Path(__file__).resolve().parent / "assets" / "halfcourt.png"
-
 
 def clamp_court(x: float, y: float):
     return (
@@ -256,55 +250,25 @@ def build_nba_halfcourt_image(w: int, h: int) -> Image.Image:
     return img
 
 
-def _resize_halfcourt(img: Image.Image, width: int, height: int) -> Image.Image:
-    """Fit asset to court pixel size: correct EXIF orientation, cover-crop to 50:47, then scale."""
-    img = ImageOps.exif_transpose(img)
-    img = img.convert("RGB")
-    w0, h0 = img.size
-    target_ratio = width / height
-    src_ratio = w0 / h0
-    try:
-        resample = Image.Resampling.LANCZOS
-    except AttributeError:
-        resample = Image.LANCZOS
-    if abs(src_ratio - target_ratio) < 1e-4:
-        cropped = img
-    elif src_ratio > target_ratio:
-        new_w = max(1, int(round(h0 * target_ratio)))
-        left = (w0 - new_w) // 2
-        cropped = img.crop((left, 0, left + new_w, h0))
-    else:
-        new_h = max(1, int(round(w0 / target_ratio)))
-        top = (h0 - new_h) // 2
-        cropped = img.crop((0, top, w0, top + new_h))
-    return cropped.resize((width, height), resample)
-
-
-def _halfcourt_asset_fingerprint() -> str:
-    """Content hash so Streamlit cache invalidates when the PNG is replaced (not just mtime)."""
-    try:
-        return hashlib.sha256(HALFCOURT_ASSET.read_bytes()).hexdigest()[:24]
-    except OSError:
-        return "missing"
+# Bump to invalidate @st.cache_data on Streamlit Cloud when court graphics change.
+_COURT_BITMAP_CACHE_VERSION = 2
 
 
 @st.cache_data(show_spinner=False)
-def _nba_halfcourt_png_bytes(width: int, height: int, _asset_fp: str) -> bytes:
-    if HALFCOURT_ASSET.is_file():
-        with Image.open(HALFCOURT_ASSET) as src:
-            img = _resize_halfcourt(src, width, height)
-    else:
-        img = build_nba_halfcourt_image(width, height)
+def _nba_halfcourt_png_bytes(width: int, height: int, _cache_v: int) -> bytes:
+    """Always build from `build_nba_halfcourt_image` (top-down). Do not load PNG files here — Cloud
+    caches were still serving an old 3/4 asset for some users."""
+    img = build_nba_halfcourt_image(width, height)
     buf = io.BytesIO()
     img.save(buf, format="PNG", compress_level=3)
     return buf.getvalue()
 
 
 def get_nba_halfcourt_rgb(width: int, height: int) -> Image.Image:
-    """Half court bitmap: `assets/halfcourt.png` when present, else generated top-down diagram."""
+    """Half court bitmap: programmatic top-down NBA half court."""
     return Image.open(
         io.BytesIO(
-            _nba_halfcourt_png_bytes(width, height, _halfcourt_asset_fingerprint())
+            _nba_halfcourt_png_bytes(width, height, _COURT_BITMAP_CACHE_VERSION)
         )
     ).convert("RGB")
 
