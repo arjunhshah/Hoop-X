@@ -79,6 +79,8 @@ THREE_LINE_INSET_FT = 3.0  # 3pt straight segments run 3' inside each sideline
 THREE_JOIN_X = COURT_X1 - THREE_LINE_INSET_FT  # 22 — where arc meets verticals
 RESTRICTED_R_FT = 4.0  # no-charge semicircle
 FT_CIRCLE_R_FT = 6.0
+# Minimum polyline length (ft) to log a layup — slightly below 1 ft so quick strokes still count
+MIN_LAYUP_PATH_FT = 0.65
 
 # Canvas / background size (50:47 court aspect; image is scaled to this)
 COURT_IMG_W = 560
@@ -1020,9 +1022,8 @@ def _render_active_session(active_sheet: str) -> None:
 
     else:
         st.caption(
-            "Draw your layup route on the court (drag to sketch your drive). "
-            "Then tap **Made** or **Missed** — the stroke is read when you click "
-            "(no live redraw while drawing, for speed)."
+            "Draw your layup route on the court (drag to sketch). "
+            "When **Made** and **Missed** enable, tap one to log the shot."
         )
         court_bg = get_nba_halfcourt_rgb(COURT_IMG_W, COURT_IMG_H).copy()
         ckey = int(st.session_state.layup_canvas_key)
@@ -1033,7 +1034,7 @@ def _render_active_session(active_sheet: str) -> None:
                 stroke_width=4,
                 stroke_color="#f4d03f",
                 background_image=court_bg,
-                update_streamlit=False,
+                update_streamlit=True,
                 height=COURT_IMG_H,
                 width=COURT_IMG_W,
                 drawing_mode="freedraw",
@@ -1043,7 +1044,7 @@ def _render_active_session(active_sheet: str) -> None:
             merged = merged_layup_from_canvas(
                 canvas_result.json_data, COURT_IMG_W, COURT_IMG_H
             )
-        has_route = len(merged) >= 2 and path_length_feet(merged) >= 1.0
+        has_route = len(merged) >= 2 and path_length_feet(merged) >= MIN_LAYUP_PATH_FT
 
         col_a, col_b, col_c = st.columns([1, 1, 1])
         if col_a.button("Clear layup drawing", type="secondary"):
