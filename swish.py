@@ -83,8 +83,10 @@ FT_CIRCLE_R_FT = 6.0
 MIN_LAYUP_PATH_FT = 0.65
 
 # Canvas / background size (50:47 court aspect; image is scaled to this)
-COURT_IMG_W = 560
+COURT_IMG_W = 512
 COURT_IMG_H = int(round(COURT_IMG_W * (COURT_Y1 - COURT_Y0) / (COURT_X1 - COURT_X0)))
+# Inset mapping so baselines / 3pt lines aren’t clipped by thick strokes at bitmap edges
+COURT_VIEW_MARGIN_PX = 8
 
 def clamp_court(x: float, y: float):
     return (
@@ -94,14 +96,20 @@ def clamp_court(x: float, y: float):
 
 
 def feet_to_pixel(x: float, y: float, w: int, h: int):
-    px = (x - COURT_X0) / (COURT_X1 - COURT_X0) * w
-    py = (COURT_Y1 - y) / (COURT_Y1 - COURT_Y0) * h
+    m = COURT_VIEW_MARGIN_PX
+    iw = max(1, w - 2 * m)
+    ih = max(1, h - 2 * m)
+    px = (x - COURT_X0) / (COURT_X1 - COURT_X0) * iw + m
+    py = (COURT_Y1 - y) / (COURT_Y1 - COURT_Y0) * ih + m
     return px, py
 
 
 def pixel_to_court(px: float, py: float, w: int, h: int):
-    x = COURT_X0 + (px / w) * (COURT_X1 - COURT_X0)
-    y = COURT_Y1 - (py / h) * (COURT_Y1 - COURT_Y0)
+    m = COURT_VIEW_MARGIN_PX
+    iw = max(1, w - 2 * m)
+    ih = max(1, h - 2 * m)
+    x = COURT_X0 + ((px - m) / iw) * (COURT_X1 - COURT_X0)
+    y = COURT_Y1 - ((py - m) / ih) * (COURT_Y1 - COURT_Y0)
     return clamp_court(x, y)
 
 
@@ -278,7 +286,7 @@ def build_nba_halfcourt_image(w: int, h: int) -> Image.Image:
 
 
 # Bump to invalidate @st.cache_data on Streamlit Cloud when court graphics change.
-_COURT_BITMAP_CACHE_VERSION = 3
+_COURT_BITMAP_CACHE_VERSION = 4
 
 
 @st.cache_data(show_spinner=False)
@@ -828,7 +836,7 @@ def _skills_bar_chart_png(jk: float, lk: float, fk: float) -> bytes:
         )
     plt.tight_layout()
     out = io.BytesIO()
-    fig.savefig(out, format="png", dpi=120, facecolor="#0d0d0d", bbox_inches="tight")
+    fig.savefig(out, format="png", dpi=88, facecolor="#0d0d0d", bbox_inches="tight")
     plt.close(fig)
     return out.getvalue()
 
@@ -1022,8 +1030,8 @@ def _render_active_session(active_sheet: str) -> None:
 
     else:
         st.caption(
-            "Draw your layup route on the court (drag to sketch). "
-            "When **Made** and **Missed** enable, tap one to log the shot."
+            "Draw your layup route, then tap **Sync stroke** so Made/Missed can read it "
+            "(avoids lag from updating on every brush movement)."
         )
         court_bg = get_nba_halfcourt_rgb(COURT_IMG_W, COURT_IMG_H).copy()
         ckey = int(st.session_state.layup_canvas_key)
@@ -1034,7 +1042,7 @@ def _render_active_session(active_sheet: str) -> None:
                 stroke_width=4,
                 stroke_color="#f4d03f",
                 background_image=court_bg,
-                update_streamlit=True,
+                update_streamlit=False,
                 height=COURT_IMG_H,
                 width=COURT_IMG_W,
                 drawing_mode="freedraw",
@@ -1044,6 +1052,13 @@ def _render_active_session(active_sheet: str) -> None:
             merged = merged_layup_from_canvas(
                 canvas_result.json_data, COURT_IMG_W, COURT_IMG_H
             )
+        if st.button(
+            "Sync stroke",
+            key=f"layup_sync_{active_sheet}_{ckey}",
+            type="secondary",
+            help="Pulls your latest drawing into the app once (needed before Made/Missed).",
+        ):
+            st.rerun()
         has_route = len(merged) >= 2 and path_length_feet(merged) >= MIN_LAYUP_PATH_FT
 
         col_a, col_b, col_c = st.columns([1, 1, 1])

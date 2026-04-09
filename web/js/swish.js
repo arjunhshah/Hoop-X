@@ -18,8 +18,9 @@
   const FT_CIRCLE_R = 6;
   const PAINT_X = 8;
   const FT_Y = 19;
-  const COURT_W = 560;
+  const COURT_W = 512;
   const COURT_H = Math.round((COURT_W * (COURT_Y1 - COURT_Y0)) / (COURT_X1 - COURT_X0));
+  const COURT_MARGIN = 8;
   const PICK_JUMP = 3;
   const PICK_LAYUP = 4;
   const SHEET_CARD_W = 260;
@@ -37,14 +38,20 @@
   let courtBgImg = null;
 
   function feetToPixel(x, y, w, h) {
-    const px = ((x - COURT_X0) / (COURT_X1 - COURT_X0)) * w;
-    const py = ((COURT_Y1 - y) / (COURT_Y1 - COURT_Y0)) * h;
+    const m = COURT_MARGIN;
+    const iw = Math.max(1, w - 2 * m);
+    const ih = Math.max(1, h - 2 * m);
+    const px = ((x - COURT_X0) / (COURT_X1 - COURT_X0)) * iw + m;
+    const py = ((COURT_Y1 - y) / (COURT_Y1 - COURT_Y0)) * ih + m;
     return [px, py];
   }
 
   function pixelToCourt(px, py, w, h) {
-    let x = COURT_X0 + (px / w) * (COURT_X1 - COURT_X0);
-    let y = COURT_Y1 - (py / h) * (COURT_Y1 - COURT_Y0);
+    const m = COURT_MARGIN;
+    const iw = Math.max(1, w - 2 * m);
+    const ih = Math.max(1, h - 2 * m);
+    let x = COURT_X0 + ((px - m) / iw) * (COURT_X1 - COURT_X0);
+    let y = COURT_Y1 - ((py - m) / ih) * (COURT_Y1 - COURT_Y0);
     x = Math.max(COURT_X0, Math.min(COURT_X1, x));
     y = Math.max(COURT_Y0, Math.min(COURT_Y1, y));
     return [x, y];
