@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
 import io
 import json
 import re
@@ -279,15 +280,16 @@ def _resize_halfcourt(img: Image.Image, width: int, height: int) -> Image.Image:
     return cropped.resize((width, height), resample)
 
 
-def _halfcourt_asset_mtime() -> float:
+def _halfcourt_asset_fingerprint() -> str:
+    """Content hash so Streamlit cache invalidates when the PNG is replaced (not just mtime)."""
     try:
-        return HALFCOURT_ASSET.stat().st_mtime
+        return hashlib.sha256(HALFCOURT_ASSET.read_bytes()).hexdigest()[:24]
     except OSError:
-        return 0.0
+        return "missing"
 
 
 @st.cache_data(show_spinner=False)
-def _nba_halfcourt_png_bytes(width: int, height: int, _asset_mtime: float) -> bytes:
+def _nba_halfcourt_png_bytes(width: int, height: int, _asset_fp: str) -> bytes:
     if HALFCOURT_ASSET.is_file():
         with Image.open(HALFCOURT_ASSET) as src:
             img = _resize_halfcourt(src, width, height)
@@ -301,7 +303,9 @@ def _nba_halfcourt_png_bytes(width: int, height: int, _asset_mtime: float) -> by
 def get_nba_halfcourt_rgb(width: int, height: int) -> Image.Image:
     """Half court bitmap: `assets/halfcourt.png` when present, else generated top-down diagram."""
     return Image.open(
-        io.BytesIO(_nba_halfcourt_png_bytes(width, height, _halfcourt_asset_mtime()))
+        io.BytesIO(
+            _nba_halfcourt_png_bytes(width, height, _halfcourt_asset_fingerprint())
+        )
     ).convert("RGB")
 
 

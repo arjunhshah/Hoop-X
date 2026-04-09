@@ -29,6 +29,8 @@
   let layupDraft = [];
   /** 0-based page index for the home sheet grid (3×3). */
   let sheetGridPage = 0;
+  /** Loaded from `assets/halfcourt.png` (same artwork as Streamlit); falls back to vector court. */
+  let courtBgImg = null;
 
   function feetToPixel(x, y, w, h) {
     const px = ((x - COURT_X0) / (COURT_X1 - COURT_X0)) * w;
@@ -137,6 +139,14 @@
   }
 
   function drawCourtBackground(ctx, w, h) {
+    if (
+      courtBgImg &&
+      courtBgImg.complete &&
+      courtBgImg.naturalWidth > 0
+    ) {
+      ctx.drawImage(courtBgImg, 0, 0, w, h);
+      return;
+    }
     const floor = "#1a2f4a";
     ctx.fillStyle = floor;
     ctx.fillRect(0, 0, w, h);
@@ -1053,7 +1063,16 @@
     });
 
     setDocumentTitle();
-    showHome();
+    const img = new Image();
+    img.onload = () => {
+      courtBgImg = img;
+      showHome();
+    };
+    img.onerror = () => {
+      courtBgImg = null;
+      showHome();
+    };
+    img.src = new URL("assets/halfcourt.png", window.location.href).href;
   }
 
   if (document.readyState === "loading") {
