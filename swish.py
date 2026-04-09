@@ -760,10 +760,11 @@ def compute_sheet_skills(today_shots: list) -> dict:
 
 
 def render_skills_chart(skills: dict) -> None:
-    """Radar chart of jump %, layup %, overall FG; falls back to bar chart if matplotlib missing."""
+    """Bar chart of jump %, layup %, overall FG (today, this sheet)."""
     jp = skills["jump_pct"]
     lp = skills["layup_pct"]
     fg = skills["fg_pct"]
+    raw = [jp, lp, fg]
     vals = [
         jp if jp is not None else 0.0,
         lp if lp is not None else 0.0,
@@ -776,34 +777,53 @@ def render_skills_chart(skills: dict) -> None:
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        n = len(labels)
-        angles = np.linspace(0, 2 * np.pi, n, endpoint=False).tolist()
-        vals_plot = vals + vals[:1]
-        angles_plot = angles + angles[:1]
-
-        fig, ax = plt.subplots(figsize=(4.0, 4.0), subplot_kw=dict(polar=True))
+        fig, ax = plt.subplots(figsize=(5.2, 3.5))
         fig.patch.set_facecolor("#0d0d0d")
         ax.set_facecolor("#111111")
-        ax.plot(angles_plot, vals_plot, color="#5cb88a", linewidth=2.2)
-        ax.fill(angles_plot, vals_plot, color="#5cb88a", alpha=0.22)
-        ax.set_xticks(angles)
-        ax.set_xticklabels(labels, color="#e0e0e0", fontsize=9)
+        x = np.arange(len(labels), dtype=float)
+        bar_w = 0.62
+        colors = ["#4ade80", "#60a5fa", "#fbbf24"]
+        bars = ax.bar(x, vals, bar_w, color=colors, edgecolor="#2a2a2a", linewidth=1)
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, color="#d4d4d4", fontsize=10)
+        ax.set_ylabel("Field goal %", color="#a3a3a3", fontsize=10)
         ax.set_ylim(0, 100)
-        ax.set_yticks([25, 50, 75, 100])
-        ax.set_yticklabels(["25", "50", "75", "100"], color="#777777", fontsize=7)
-        ax.tick_params(axis="x", colors="#e0e0e0")
-        ax.grid(color="#333333", linestyle="-", linewidth=0.5)
-        ax.set_title("Skills (%)", color="#cccccc", fontsize=11, pad=14)
+        ax.set_yticks([0, 25, 50, 75, 100])
+        ax.tick_params(axis="y", colors="#888888", labelsize=8)
+        ax.grid(axis="y", color="#2a2a2a", linestyle="-", linewidth=0.6, alpha=0.95)
+        ax.set_axisbelow(True)
+        for spine in ax.spines.values():
+            spine.set_color("#333333")
+        ax.set_title("Skills — today on this sheet", color="#e5e5e5", fontsize=11, pad=10)
+        for b, v, r in zip(bars, vals, raw):
+            h = b.get_height()
+            if r is None and v == 0.0:
+                txt = "—"
+            else:
+                txt = f"{v:.0f}%"
+            ax.annotate(
+                txt,
+                xy=(b.get_x() + b.get_width() / 2, h),
+                xytext=(0, 3),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                color="#e5e5e5",
+                fontsize=9,
+            )
         plt.tight_layout()
         st.pyplot(fig, clear_figure=True, use_container_width=True)
     except ImportError:
-        st.bar_chart(
-            {
-                "Jump %": [vals[0]],
-                "Layup %": [vals[1]],
-                "FG%": [vals[2]],
-            }
-        )
+        cj, cl, co = st.columns(3)
+        for col, lab, v, r in (
+            (cj, labels[0], vals[0], raw[0]),
+            (cl, labels[1], vals[1], raw[1]),
+            (co, labels[2], vals[2], raw[2]),
+        ):
+            col.metric(
+                lab,
+                f"{v:.0f}%" if r is not None or v > 0 else "—",
+            )
 
 
 def tracker_app():
@@ -902,7 +922,7 @@ def tracker_app():
         fg_label = f"{skills['fg_pct']:.1f}%" if skills["fg_pct"] is not None else "—"
         m3.metric("FG%", fg_label)
 
-        st.write("##### Skills chart")
+        st.write("##### Skills")
         sk_l, sk_r = st.columns([1.15, 1])
         with sk_l:
             render_skills_chart(skills)
