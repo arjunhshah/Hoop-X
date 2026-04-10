@@ -36,6 +36,12 @@
   let sheetGridPage = 0;
   /** Loaded from `assets/halfcourt.png` (same artwork as Streamlit); falls back to vector court. */
   let courtBgImg = null;
+  /** Glossy made-shot marker; `assets/green_dot.png` (same as Streamlit). */
+  let greenDotImg = null;
+  /** Pending jump marker; `assets/yellow_pending.png` (yellow crosshair). */
+  let yellowPendingImg = null;
+  /** Miss marker; `assets/red_dot.png` (same as Streamlit). */
+  let redDotImg = null;
 
   function feetToPixel(x, y, w, h) {
     const m = COURT_MARGIN;
@@ -274,37 +280,89 @@
       ctx.beginPath();
       ctx.arc(px + 2, py + 2, r, 0, Math.PI * 2);
       ctx.fill();
-      ctx.strokeStyle = "#fff";
-      ctx.lineWidth = 3;
-      ctx.fillStyle = "rgba(34,197,94,0.97)";
-      ctx.beginPath();
-      ctx.arc(px, py, r, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.stroke();
+      const d = 2 * r;
+      if (
+        greenDotImg &&
+        greenDotImg.complete &&
+        greenDotImg.naturalWidth > 0
+      ) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(px, py, r, 0, Math.PI * 2);
+        ctx.clip();
+        ctx.drawImage(greenDotImg, px - r, py - r, d, d);
+        ctx.restore();
+        ctx.strokeStyle = "rgba(255,255,255,0.9)";
+        ctx.lineWidth = Math.max(2, (3 * ctx.canvas.width) / COURT_W);
+        ctx.beginPath();
+        ctx.arc(px, py, r, 0, Math.PI * 2);
+        ctx.stroke();
+      } else {
+        ctx.strokeStyle = "#fff";
+        ctx.lineWidth = 3;
+        ctx.fillStyle = "rgba(34,197,94,0.97)";
+        ctx.beginPath();
+        ctx.arc(px, py, r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+      }
     } else if (kind === "miss") {
       ctx.fillStyle = "rgba(0,0,0,0.22)";
       ctx.beginPath();
       ctx.arc(px + 2, py + 2, r, 0, Math.PI * 2);
       ctx.fill();
-      ctx.strokeStyle = "#fff";
-      ctx.lineWidth = 3;
-      ctx.fillStyle = "rgba(239,68,68,0.97)";
-      ctx.beginPath();
-      ctx.arc(px, py, r, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.stroke();
+      const d = 2 * r;
+      if (redDotImg && redDotImg.complete && redDotImg.naturalWidth > 0) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(px, py, r, 0, Math.PI * 2);
+        ctx.clip();
+        ctx.drawImage(redDotImg, px - r, py - r, d, d);
+        ctx.restore();
+        ctx.strokeStyle = "rgba(255,255,255,0.9)";
+        ctx.lineWidth = Math.max(2, (3 * ctx.canvas.width) / COURT_W);
+        ctx.beginPath();
+        ctx.arc(px, py, r, 0, Math.PI * 2);
+        ctx.stroke();
+      } else {
+        ctx.strokeStyle = "#fff";
+        ctx.lineWidth = 3;
+        ctx.fillStyle = "rgba(239,68,68,0.97)";
+        ctx.beginPath();
+        ctx.arc(px, py, r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+      }
     } else {
       const ro = (17 * ctx.canvas.width) / COURT_W;
-      ctx.strokeStyle = "#fbbf24";
-      ctx.lineWidth = 4;
+      ctx.fillStyle = "rgba(0,0,0,0.2)";
       ctx.beginPath();
-      ctx.arc(px, py, ro, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.fillStyle = "rgba(253,224,71,0.95)";
-      const ri = (11 * ctx.canvas.width) / COURT_W;
-      ctx.beginPath();
-      ctx.arc(px, py, ri, 0, Math.PI * 2);
+      ctx.arc(px + 2, py + 2, ro, 0, Math.PI * 2);
       ctx.fill();
+      const d = 2 * ro;
+      if (
+        yellowPendingImg &&
+        yellowPendingImg.complete &&
+        yellowPendingImg.naturalWidth > 0
+      ) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(px, py, ro, 0, Math.PI * 2);
+        ctx.clip();
+        ctx.drawImage(yellowPendingImg, px - ro, py - ro, d, d);
+        ctx.restore();
+      } else {
+        ctx.strokeStyle = "#fbbf24";
+        ctx.lineWidth = 4;
+        ctx.beginPath();
+        ctx.arc(px, py, ro, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.fillStyle = "rgba(253,224,71,0.95)";
+        const ri = (11 * ctx.canvas.width) / COURT_W;
+        ctx.beginPath();
+        ctx.arc(px, py, ri, 0, Math.PI * 2);
+        ctx.fill();
+      }
     }
   }
 
@@ -1124,6 +1182,36 @@
       showHome();
     };
     img.src = new URL("assets/halfcourt.png", window.location.href).href;
+
+    const gd = new Image();
+    gd.onload = () => {
+      greenDotImg = gd;
+      refreshAll();
+    };
+    gd.onerror = () => {
+      greenDotImg = null;
+    };
+    gd.src = new URL("assets/green_dot.png", window.location.href).href;
+
+    const yp = new Image();
+    yp.onload = () => {
+      yellowPendingImg = yp;
+      refreshAll();
+    };
+    yp.onerror = () => {
+      yellowPendingImg = null;
+    };
+    yp.src = new URL("assets/yellow_pending.png", window.location.href).href;
+
+    const rd = new Image();
+    rd.onload = () => {
+      redDotImg = rd;
+      refreshAll();
+    };
+    rd.onerror = () => {
+      redDotImg = null;
+    };
+    rd.src = new URL("assets/red_dot.png", window.location.href).href;
   }
 
   if (document.readyState === "loading") {

@@ -6,6 +6,7 @@ import io
 import json
 import re
 from functools import lru_cache
+from pathlib import Path
 
 import streamlit as st
 import numpy as np
@@ -118,6 +119,37 @@ _PICK_FT_JUMP = 3.0
 _PICK_FT_LAYUP = 4.0
 
 
+def _layup_point_xy(p) -> tuple[float, float] | None:
+    """Normalize a layup vertex from [x,y], (x,y), or dict with x/y (or 0/1)."""
+    if p is None:
+        return None
+    if isinstance(p, (list, tuple)) and len(p) >= 2:
+        try:
+            return float(p[0]), float(p[1])
+        except (TypeError, ValueError):
+            return None
+    if isinstance(p, dict):
+        for k1, k2 in (("x", "y"), ("X", "Y"), ("0", "1")):
+            if k1 in p and k2 in p:
+                try:
+                    return float(p[k1]), float(p[k2])
+                except (TypeError, ValueError):
+                    return None
+    return None
+
+
+def layup_path_to_pairs(path) -> list[tuple[float, float]]:
+    """Court (x,y) pairs from stored layup_path; skips vertices we cannot parse."""
+    if not isinstance(path, list):
+        return []
+    out: list[tuple[float, float]] = []
+    for p in path:
+        xy = _layup_point_xy(p)
+        if xy is not None:
+            out.append(xy)
+    return out
+
+
 def _dist_point_segment(
     px: float, py: float, ax: float, ay: float, bx: float, by: float
 ) -> float:
@@ -151,9 +183,9 @@ def find_shot_near_court_click(
     for s in today_shots:
         if s.get("shot_kind") == "layup":
             path = s.get("layup_path")
-            if not isinstance(path, list) or len(path) < 2:
+            pts = layup_path_to_pairs(path)
+            if len(pts) < 2:
                 continue
-            pts = [(float(p[0]), float(p[1])) for p in path]
             dmin = _court_dist_to_polyline(cx, cy, pts)
             lim = _PICK_FT_LAYUP
         else:
@@ -172,7 +204,7 @@ def format_shot_one_line(shot: dict) -> str:
     t = shot["created_date"].strftime("%H:%M:%S")
     res = shot["result"].upper()
     if shot.get("shot_kind") == "layup":
-        n = len(shot.get("layup_path") or [])
+        n = len(layup_path_to_pairs(shot.get("layup_path") or []))
         return f"{res} layup · {n} pts · {t}"
     cx, cy = shot.get("court_x"), shot.get("court_y")
     if cx is not None and cy is not None:
@@ -322,8 +354,44 @@ def get_nba_halfcourt_rgb(width: int, height: int) -> Image.Image:
     ).convert("RGB")
 
 
-def _draw_jump_marker(dr: ImageDraw.ImageDraw, cx: float, cy: float, kind: str) -> None:
-    """Made / miss / pending markers: shadow, bold rim, inner highlight (reads well on photo courts)."""
+_GREEN_DOT_PATH = Path(__file__).resolve().parent / "assets" / "green_dot.png"
+_RED_DOT_PATH = Path(__file__).resolve().parent / "assets" / "red_dot.png"
+_YELLOW_PENDING_PATH = Path(__file__).resolve().parent / "assets" / "yellow_pending.png"
+_MADE_MARKER_DIAM = 26  # matches former r=13 jump-shot marker
+_MISS_MARKER_DIAM = 26
+_PENDING_MARKER_DIAM = 34  # matches former r_out=17 pending reticle
+
+
+@lru_cache(maxsize=16)
+def _circle_masked_sprite(asset_path: str, diameter_px: int) -> Image.Image:
+    """Raster asset cropped to a centered circle, then resized (drops square matte)."""
+    im_rgb = Image.open(asset_path).convert("RGB")
+    w, h = im_rgb.size
+    cx, cy = w // 2, h // 2
+    r = int(min(w, h) * 0.46)
+    mask = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(mask).ellipse((cx - r, cy - r, cx + r, cy + r), fill=255)
+    out = im_rgb.convert("RGBA")
+    out.putalpha(mask)
+    return out.resize((diameter_px, diameter_px), Image.Resampling.LANCZOS)
+
+
+def _green_dot_sprite(diameter_px: int) -> Image.Image:
+    return _circle_masked_sprite(str(_GREEN_DOT_PATH), diameter_px)
+
+
+def _red_dot_sprite(diameter_px: int) -> Image.Image:
+    return _circle_masked_sprite(str(_RED_DOT_PATH), diameter_px)
+
+
+def _yellow_pending_sprite(diameter_px: int) -> Image.Image:
+    return _circle_masked_sprite(str(_YELLOW_PENDING_PATH), diameter_px)
+
+
+def _draw_jump_marker(
+    img: Image.Image, dr: ImageDraw.ImageDraw, cx: float, cy: float, kind: str
+) -> None:
+    """Made / miss / pending use assets/green_dot, red_dot, yellow_pending (vector fallbacks if missing)."""
     cx, cy = float(cx), float(cy)
 
     def _ellipse(bb, **kw):
@@ -331,67 +399,89 @@ def _draw_jump_marker(dr: ImageDraw.ImageDraw, cx: float, cy: float, kind: str) 
 
     if kind == "made":
         r = 13
+        d = _MADE_MARKER_DIAM
         _ellipse(
             (cx - r + 3, cy - r + 3, cx + r + 3, cy + r + 3),
             fill=(0, 0, 0, 55),
         )
-        _ellipse(
-            (cx - r, cy - r, cx + r, cy + r),
-            fill=(34, 197, 94, 248),
-            outline=(255, 255, 255, 255),
-            width=3,
-        )
-        hi = 5.0
-        _ellipse(
-            (cx - r * 0.5, cy - r * 0.55, cx - r * 0.5 + hi * 2, cy - r * 0.55 + hi * 2),
-            fill=(200, 255, 215, 190),
-        )
+        try:
+            dot = _green_dot_sprite(d)
+            x = int(round(cx - d / 2))
+            y = int(round(cy - d / 2))
+            img.paste(dot, (x, y), dot)
+        except OSError:
+            _ellipse(
+                (cx - r, cy - r, cx + r, cy + r),
+                fill=(34, 197, 94, 248),
+                outline=(255, 255, 255, 255),
+                width=3,
+            )
+            hi = 5.0
+            _ellipse(
+                (cx - r * 0.5, cy - r * 0.55, cx - r * 0.5 + hi * 2, cy - r * 0.55 + hi * 2),
+                fill=(200, 255, 215, 190),
+            )
     elif kind == "miss":
         r = 13
+        d = _MISS_MARKER_DIAM
         _ellipse(
             (cx - r + 3, cy - r + 3, cx + r + 3, cy + r + 3),
             fill=(0, 0, 0, 55),
         )
-        _ellipse(
-            (cx - r, cy - r, cx + r, cy + r),
-            fill=(239, 68, 68, 248),
-            outline=(255, 255, 255, 255),
-            width=3,
-        )
-        hi = 5.0
-        _ellipse(
-            (cx - r * 0.5, cy - r * 0.55, cx - r * 0.5 + hi * 2, cy - r * 0.55 + hi * 2),
-            fill=(255, 210, 210, 190),
-        )
+        try:
+            dot = _red_dot_sprite(d)
+            x = int(round(cx - d / 2))
+            y = int(round(cy - d / 2))
+            img.paste(dot, (x, y), dot)
+        except OSError:
+            _ellipse(
+                (cx - r, cy - r, cx + r, cy + r),
+                fill=(239, 68, 68, 248),
+                outline=(255, 255, 255, 255),
+                width=3,
+            )
+            hi = 5.0
+            _ellipse(
+                (cx - r * 0.5, cy - r * 0.55, cx - r * 0.5 + hi * 2, cy - r * 0.55 + hi * 2),
+                fill=(255, 210, 210, 190),
+            )
     else:
-        # pending — target / crosshair
-        r_out, r_in = 17, 11
+        # pending — yellow crosshair asset
+        r_out = 17
+        d = _PENDING_MARKER_DIAM
         _ellipse(
             (cx - r_out + 2, cy - r_out + 2, cx + r_out + 2, cy + r_out + 2),
             fill=(0, 0, 0, 50),
         )
-        _ellipse(
-            (cx - r_out, cy - r_out, cx + r_out, cy + r_out),
-            outline=(251, 191, 36, 255),
-            width=4,
-        )
-        _ellipse(
-            (cx - r_in, cy - r_in, cx + r_in, cy + r_in),
-            fill=(253, 224, 71, 245),
-            outline=(255, 255, 255, 255),
-            width=2,
-        )
-        dot = 4.0
-        _ellipse(
-            (cx - dot, cy - dot, cx + dot, cy + dot),
-            fill=(255, 255, 255, 230),
-        )
-        ext = 9.0
-        w_tick = 2
-        dr.line((cx - r_out - ext, cy, cx - r_out, cy), fill=(255, 255, 255, 200), width=w_tick)
-        dr.line((cx + r_out, cy, cx + r_out + ext, cy), fill=(255, 255, 255, 200), width=w_tick)
-        dr.line((cx, cy - r_out - ext, cx, cy - r_out), fill=(255, 255, 255, 200), width=w_tick)
-        dr.line((cx, cy + r_out, cx, cy + r_out + ext), fill=(255, 255, 255, 200), width=w_tick)
+        try:
+            spr = _yellow_pending_sprite(d)
+            x = int(round(cx - d / 2))
+            y = int(round(cy - d / 2))
+            img.paste(spr, (x, y), spr)
+        except OSError:
+            r_in = 11
+            _ellipse(
+                (cx - r_out, cy - r_out, cx + r_out, cy + r_out),
+                outline=(251, 191, 36, 255),
+                width=4,
+            )
+            _ellipse(
+                (cx - r_in, cy - r_in, cx + r_in, cy + r_in),
+                fill=(253, 224, 71, 245),
+                outline=(255, 255, 255, 255),
+                width=2,
+            )
+            dot = 4.0
+            _ellipse(
+                (cx - dot, cy - dot, cx + dot, cy + dot),
+                fill=(255, 255, 255, 230),
+            )
+            ext = 9.0
+            w_tick = 2
+            dr.line((cx - r_out - ext, cy, cx - r_out, cy), fill=(255, 255, 255, 200), width=w_tick)
+            dr.line((cx + r_out, cy, cx + r_out + ext, cy), fill=(255, 255, 255, 200), width=w_tick)
+            dr.line((cx, cy - r_out - ext, cx, cy - r_out), fill=(255, 255, 255, 200), width=w_tick)
+            dr.line((cx, cy + r_out, cx, cy + r_out + ext), fill=(255, 255, 255, 200), width=w_tick)
 
 
 def _draw_inspect_highlight(dr: ImageDraw.ImageDraw, shot: dict, w: int, h: int) -> None:
@@ -402,10 +492,10 @@ def _draw_inspect_highlight(dr: ImageDraw.ImageDraw, shot: dict, w: int, h: int)
     cyan = (56, 189, 248, 255)
     ring = (255, 255, 255, 220)
     if shot.get("shot_kind") == "layup":
-        path = shot.get("layup_path") or []
-        if len(path) < 2:
+        pairs = layup_path_to_pairs(shot.get("layup_path") or [])
+        if len(pairs) < 2:
             return
-        pix = [court_to_px((float(p[0]), float(p[1]))) for p in path]
+        pix = [court_to_px((x, y)) for x, y in pairs]
         for i in range(len(pix) - 1):
             dr.line([pix[i], pix[i + 1]], fill=cyan, width=10)
             dr.line([pix[i], pix[i + 1]], fill=ring, width=4)
@@ -496,14 +586,14 @@ def composite_court_with_shots(
 
     for xy in jump_made:
         px, py = court_to_px(xy)
-        _draw_jump_marker(dr, px, py, "made")
+        _draw_jump_marker(img, dr, px, py, "made")
     for xy in jump_miss:
         px, py = court_to_px(xy)
-        _draw_jump_marker(dr, px, py, "miss")
+        _draw_jump_marker(img, dr, px, py, "miss")
 
     if pending_court_xy is not None:
         px, py = court_to_px(pending_court_xy)
-        _draw_jump_marker(dr, px, py, "pending")
+        _draw_jump_marker(img, dr, px, py, "pending")
 
     if draft_layup_path is not None and len(draft_layup_path) >= 2:
         _draw_draft_layup_path(dr, draft_layup_path, w, h)
@@ -580,6 +670,15 @@ def fabric_path_to_pixel_points(path_cmds: list) -> list[tuple[float, float]]:
     return pts
 
 
+def _safe_float(v, default: float = 0.0) -> float:
+    try:
+        if v is None:
+            return default
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
 def path_pixels_from_fabric_object(obj: dict, w: int, h: int) -> list[tuple[float, float]]:
     """Path points in canvas pixel space; picks pathOffset transform vs raw when it maps better to the court."""
     raw = obj.get("path")
@@ -599,12 +698,12 @@ def path_pixels_from_fabric_object(obj: dict, w: int, h: int) -> list[tuple[floa
 
     po = obj.get("pathOffset")
     if isinstance(po, dict) and ("x" in po or "y" in po):
-        ox = float(po.get("x", 0) or 0)
-        oy = float(po.get("y", 0) or 0)
-        left = float(obj.get("left", 0) or 0)
-        top = float(obj.get("top", 0) or 0)
-        sx = float(obj.get("scaleX", 1) or 1)
-        sy = float(obj.get("scaleY", 1) or 1)
+        ox = _safe_float(po.get("x"), 0.0)
+        oy = _safe_float(po.get("y"), 0.0)
+        left = _safe_float(obj.get("left"), 0.0)
+        top = _safe_float(obj.get("top"), 0.0)
+        sx = _safe_float(obj.get("scaleX"), 1.0) or 1.0
+        sy = _safe_float(obj.get("scaleY"), 1.0) or 1.0
         adj = [(left + (px - ox) * sx, top + (py - oy) * sy) for px, py in pts]
         if _inside_ratio(adj) >= _inside_ratio(pts):
             return adj
@@ -636,7 +735,11 @@ def canvas_state_to_court_paths(canvas_json, w: int, h: int) -> list[list[tuple[
     if not isinstance(data, dict):
         return []
 
-    objects = data.get("objects") or []
+    raw_objects = data.get("objects")
+    if not isinstance(raw_objects, list):
+        # Fabric / component quirks: objects as str or dict would iterate wrong types → .get AttributeError
+        return []
+    objects = raw_objects
     paths: list[list[tuple[float, float]]] = []
     for obj in objects:
         if not isinstance(obj, dict):
@@ -698,9 +801,15 @@ class Base44:
         return sorted(self.shots, key=lambda s: s["created_date"], reverse=True)[:limit]
 
     def create_shot(self, data):
-        data["id"] = len(self.shots) + 1
-        data["created_date"] = datetime.datetime.now()
-        self.shots.append(data)
+        # Copy so caller cannot mutate a stored record; canonicalize layup_path in-process.
+        rec = dict(data)
+        lp = rec.get("layup_path")
+        if lp is not None:
+            pairs = layup_path_to_pairs(lp) if isinstance(lp, list) else []
+            rec["layup_path"] = [[a, b] for a, b in pairs]
+        rec["id"] = len(self.shots) + 1
+        rec["created_date"] = datetime.datetime.now()
+        self.shots.append(rec)
 
     def delete_shot(self, shot_id):
         self.shots = [s for s in self.shots if s["id"] != shot_id]
@@ -742,8 +851,8 @@ def split_shots_for_map(today_shots: list):
     for s in today_shots:
         if s.get("shot_kind") == "layup":
             path = s.get("layup_path")
-            if isinstance(path, list) and len(path) >= 2:
-                tup = [(float(p[0]), float(p[1])) for p in path]
+            tup = layup_path_to_pairs(path)
+            if len(tup) >= 2:
                 if s["result"] == "made":
                     lay_made.append(tup)
                 else:
@@ -787,9 +896,12 @@ def compute_sheet_skills(today_shots: list) -> dict:
     }
 
 
-@st.cache_data(show_spinner=False)
 def _skills_bar_chart_png(jk: float, lk: float, fk: float) -> bytes:
-    """Cached matplotlib render (jump/layup/FG use -1.0 when rate is undefined)."""
+    """Matplotlib render (jump/layup/FG use -1.0 when rate is undefined).
+
+    Not st.cache_data: server-wide chart cache can confuse multi-user deployments
+    (same percentages → same cache key) and is unnecessary for this small figure.
+    """
     import matplotlib
 
     matplotlib.use("Agg")
@@ -1119,8 +1231,7 @@ def _render_active_session(active_sheet: str) -> None:
     st.write("##### Recent on this sheet")
     for shot in today_shots[:8]:
         if shot.get("shot_kind") == "layup":
-            path = shot.get("layup_path") or []
-            loc = f"layup · {len(path)} pts"
+            loc = f"layup · {len(layup_path_to_pairs(shot.get('layup_path') or []))} pts"
         else:
             cx = shot.get("court_x")
             cy = shot.get("court_y")
@@ -1128,10 +1239,6 @@ def _render_active_session(active_sheet: str) -> None:
         st.write(
             f"- [{shot['result'].upper()}] {loc} · {shot['created_date'].strftime('%H:%M:%S')}"
         )
-
-
-if hasattr(st, "fragment"):
-    _render_active_session = st.fragment(_render_active_session)
 
 
 def tracker_app():
@@ -1276,7 +1383,7 @@ def tracker_app():
         for shot in recent:
             sheet = shot.get("session_name", "—")
             if shot.get("shot_kind") == "layup":
-                n = len(shot.get("layup_path") or [])
+                n = len(layup_path_to_pairs(shot.get("layup_path") or []))
                 loc = f" layup ({n} pts)"
             else:
                 cx, cy = shot.get("court_x"), shot.get("court_y")
