@@ -639,6 +639,8 @@ def canvas_state_to_court_paths(canvas_json, w: int, h: int) -> list[list[tuple[
     objects = data.get("objects") or []
     paths: list[list[tuple[float, float]]] = []
     for obj in objects:
+        if not isinstance(obj, dict):
+            continue
         if obj.get("type") != "path":
             continue
         pix = path_pixels_from_fabric_object(obj, w, h)
@@ -1049,8 +1051,10 @@ def _render_active_session(active_sheet: str) -> None:
                 key=f"layup_canvas_{active_sheet}_{ckey}",
                 display_toolbar=True,
             )
+            # Safe for None, or streamlit-drawable-canvas returning the class before first paint.
+            layup_json = getattr(canvas_result, "json_data", None)
             merged = merged_layup_from_canvas(
-                canvas_result.json_data, COURT_IMG_W, COURT_IMG_H
+                layup_json, COURT_IMG_W, COURT_IMG_H
             )
         if st.button(
             "Sync stroke",
