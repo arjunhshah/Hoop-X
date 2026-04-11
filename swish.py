@@ -740,6 +740,19 @@ def composite_court_with_shots(
     return img.convert("RGB")
 
 
+def _coach_marker_palette(which: str) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Fill and outline RGBA for blue vs red coach markers."""
+    if which.lower() == "red":
+        return ((215, 60, 60, 245), (255, 210, 210, 255))
+    return ((45, 120, 225, 245), (200, 225, 255, 255))
+
+
+def _coach_pending_line_rgba(which: str) -> tuple[int, ...]:
+    if which.lower() == "red":
+        return (255, 110, 110, 255)
+    return (120, 175, 255, 255)
+
+
 def composite_full_court_coach(
     base: Image.Image,
     w: int,
@@ -748,12 +761,14 @@ def composite_full_court_coach(
     pending_court_xy: tuple[float, float] | None = None,
     *,
     side: str = "offence",
+    pending_ring_color: str | None = None,
 ) -> Image.Image:
-    """Draw numbered player markers; offence = blue, defence = red; court tinted to match."""
+    """Court tint follows offence/defence mode; each marker uses stored blue/red (or mode default)."""
     from collections import defaultdict
 
     sl = side.lower()
     is_defence = sl in ("defence", "defense")
+    default_mc = "red" if is_defence else "blue"
 
     img = base.copy().convert("RGBA")
     if is_defence:
@@ -763,9 +778,10 @@ def composite_full_court_coach(
     img = Image.alpha_composite(img, tint)
     dr = ImageDraw.Draw(img, "RGBA")
 
-    mk_fill = (215, 60, 60, 245) if is_defence else (45, 120, 225, 245)
-    mk_outline = (255, 210, 210, 255) if is_defence else (200, 225, 255, 255)
-    pend_line = (255, 110, 110, 255) if is_defence else (120, 175, 255, 255)
+    pr = (pending_ring_color or default_mc).lower()
+    if pr not in ("blue", "red"):
+        pr = default_mc
+    pend_line = _coach_pending_line_rgba(pr)
 
     groups: dict[tuple[float, float], list[tuple[int, dict]]] = defaultdict(list)
     for i, m in enumerate(markers):
@@ -785,6 +801,10 @@ def composite_full_court_coach(
             cx = px0
             num = str(m.get("number", "?")).strip() or "?"
             r = 17
+            mc = str(m.get("color", default_mc)).lower()
+            if mc not in ("blue", "red"):
+                mc = default_mc
+            mk_fill, mk_outline = _coach_marker_palette(mc)
             dr.ellipse(
                 (cx - r, cy - r, cx + r, cy + r),
                 fill=mk_fill,
@@ -969,8 +989,8 @@ def _render_coach_dashboard() -> None:
     with hdr_l:
         side_now = st.session_state.get("coach_side", "offence")
         st.markdown(
-            f"**Mode:** **{side_now.capitalize()}** — **offence** uses a blue court & markers; "
-            "**defence** uses red. Each mode keeps its own markers."
+            f"**Mode:** **{side_now.capitalize()}** — court tint follows mode (blue / red); "
+            "each marker’s **color** is chosen when you place it."
         )
     with hdr_r:
         tgt = "Defence" if side_now == "offence" else "Offence"
@@ -981,6 +1001,7 @@ def _render_coach_dashboard() -> None:
         ):
             st.session_state.coach_side = "defence" if side_now == "offence" else "offence"
             st.session_state.coach_pending = None
+            st.session_state.pop("coach_pcolor_radio", None)
             st.rerun()
 
     add_l, add_r = st.columns([4, 1])
@@ -999,6 +1020,7 @@ def _render_coach_dashboard() -> None:
                     st.session_state.coach_sheets.append(name)
                 st.session_state.coach_active_sheet = name
                 st.session_state.coach_pending = None
+                st.session_state.pop("coach_pcolor_radio", None)
                 st.rerun()
 
     sheets = list(st.session_state.coach_sheets)
@@ -1013,6 +1035,7 @@ def _render_coach_dashboard() -> None:
     pick = st.selectbox("Play sheet", options=sheets, key="coach_sheet_select")
     if prev_sheet != pick:
         st.session_state.coach_pending = None
+        st.session_state.pop("coach_pcolor_radio", None)
     st.session_state._coach_ui_prev_sheet = pick
     st.session_state.coach_active_sheet = pick
 
@@ -1024,6 +1047,18 @@ def _render_coach_dashboard() -> None:
 
     pending = st.session_state.get("coach_pending")
 
+    if isinstance(pending, dict) and pending.get("x") is not None:
+        if "coach_pcolor_radio" not in st.session_state:
+            st.session_state["coach_pcolor_radio"] = (
+                "Red" if str(side).lower() in ("defence", "defense") else "Blue"
+            )
+
+    pending_ring_color: str | None = None
+    if isinstance(pending, dict) and pending.get("x") is not None:
+        pending_ring_color = (
+            "red" if st.session_state.get("coach_pcolor_radio") == "Red" else "blue"
+        )
+
     base = get_nba_fullcourt_rgb(FULL_COURT_IMG_W, FULL_COURT_IMG_H)
     court_rgb = composite_full_court_coach(
         base,
@@ -1034,10 +1069,11 @@ def _render_coach_dashboard() -> None:
         if isinstance(pending, dict) and "x" in pending
         else None,
         side=side,
+        pending_ring_color=pending_ring_color,
     )
 
     st.caption(
-        "Tap the full court to pick a spot. The jersey # field appears **beside** the court (not below)."
+        "Tap the court to pick a spot. Beside the court: choose **Blue** or **Red**, jersey #, then **Place marker**."
     )
 
     dedup_k = f"_coach_fc_dedup_{pick}_{side}"
@@ -1053,6 +1089,7 @@ def _render_coach_dashboard() -> None:
         txy = (int(round(nx)), int(round(ny)))
         if st.session_state.get(dedup_k) != txy:
             st.session_state[dedup_k] = txy
+            st.session_state.pop("coach_pcolor_radio", None)
             st.session_state.coach_pending = {"x": cx, "y": cy}
             st.rerun()
 
@@ -1064,6 +1101,12 @@ def _render_coach_dashboard() -> None:
                 st.caption(
                     f"**Spot (ft):** ({float(pending['x']):.1f}, {float(pending['y']):.1f})"
                 )
+                st.radio(
+                    "Marker color",
+                    ["Blue", "Red"],
+                    horizontal=True,
+                    key="coach_pcolor_radio",
+                )
                 st.text_input(
                     "Jersey #",
                     key="coach_jersey_txt",
@@ -1074,6 +1117,11 @@ def _render_coach_dashboard() -> None:
                 cancel_key = f"coach_cancel_{mk}"
                 if st.button("Place marker", type="primary", key=place_key, use_container_width=True):
                     num = str(st.session_state.get("coach_jersey_txt", "")).strip() or "?"
+                    mcol = (
+                        "red"
+                        if st.session_state.get("coach_pcolor_radio") == "Red"
+                        else "blue"
+                    )
                     nid = int(st.session_state.get("coach_marker_seq", 1))
                     st.session_state.coach_marker_seq = nid + 1
                     markers.append(
@@ -1082,15 +1130,18 @@ def _render_coach_dashboard() -> None:
                             "x": float(pending["x"]),
                             "y": float(pending["y"]),
                             "number": num,
+                            "color": mcol,
                         }
                     )
                     st.session_state.coach_markers[mk] = markers
                     st.session_state.coach_pending = None
                     st.session_state.pop("coach_jersey_txt", None)
+                    st.session_state.pop("coach_pcolor_radio", None)
                     st.rerun()
                 if st.button("Cancel", key=cancel_key, use_container_width=True):
                     st.session_state.coach_pending = None
                     st.session_state.pop("coach_jersey_txt", None)
+                    st.session_state.pop("coach_pcolor_radio", None)
                     st.rerun()
         with court_col:
             picked = streamlit_image_coordinates(
@@ -1119,6 +1170,7 @@ def _render_coach_dashboard() -> None:
     if u2.button("Clear markers (this sheet · this mode)", key="coach_clear_mk"):
         st.session_state.coach_markers[mk] = []
         st.session_state.coach_pending = None
+        st.session_state.pop("coach_pcolor_radio", None)
         st.rerun()
 
 
