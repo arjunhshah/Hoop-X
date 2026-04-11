@@ -847,9 +847,63 @@ def path_length_feet(pts: list[tuple[float, float]]) -> float:
     return s
 
 
+SHOTS_JSON_PATH = Path(__file__).resolve().parent / "data" / "shots.json"
+
+
+def _shot_record_to_jsonable(rec: dict) -> dict:
+    out = dict(rec)
+    cd = out.get("created_date")
+    if isinstance(cd, datetime.datetime):
+        out["created_date"] = cd.isoformat()
+    return out
+
+
+def _shot_record_from_jsonable(d: dict) -> dict:
+    out = dict(d)
+    cd = out.get("created_date")
+    if isinstance(cd, str):
+        try:
+            out["created_date"] = datetime.datetime.fromisoformat(cd)
+        except ValueError:
+            out["created_date"] = datetime.datetime.now()
+    return out
+
+
 class Base44:
+    """In-memory shot list persisted to ``data/shots.json`` (next to ``swish.py``)."""
+
     def __init__(self):
+        self.shots: list = []
+        self._load_from_disk()
+
+    def _load_from_disk(self) -> None:
+        if not SHOTS_JSON_PATH.is_file():
+            return
+        try:
+            raw = json.loads(SHOTS_JSON_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(raw, list):
+            return
         self.shots = []
+        for item in raw:
+            if isinstance(item, dict):
+                self.shots.append(_shot_record_from_jsonable(item))
+
+    def _save_to_disk(self) -> None:
+        SHOTS_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = [_shot_record_to_jsonable(s) for s in self.shots]
+        tmp = SHOTS_JSON_PATH.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        tmp.replace(SHOTS_JSON_PATH)
+
+    def _next_shot_id(self) -> int:
+        if not self.shots:
+            return 1
+        return max(int(s["id"]) for s in self.shots if s.get("id") is not None) + 1
 
     def list_shots(self, limit=500):
         return sorted(self.shots, key=lambda s: s["created_date"], reverse=True)[:limit]
@@ -861,12 +915,14 @@ class Base44:
         if lp is not None:
             pairs = layup_path_to_pairs(lp) if isinstance(lp, list) else []
             rec["layup_path"] = [[a, b] for a, b in pairs]
-        rec["id"] = len(self.shots) + 1
+        rec["id"] = self._next_shot_id()
         rec["created_date"] = datetime.datetime.now()
         self.shots.append(rec)
+        self._save_to_disk()
 
     def delete_shot(self, shot_id):
         self.shots = [s for s in self.shots if s["id"] != shot_id]
+        self._save_to_disk()
 
 
 def _layup_three_state_key(sheet: str) -> str:
