@@ -514,7 +514,8 @@ h1.page-title {
 }
 
 .court-wrap {
-  max-width: 840px;
+  width: 100%;
+  max-width: 100%;
   margin: 1rem auto;
 }
 

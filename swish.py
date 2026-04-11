@@ -89,6 +89,17 @@ LAYUP_THREE_START_FT = (0.0, 6.5)
 # Canvas / background size (50:47 court aspect; image is scaled to this)
 COURT_IMG_W = 768
 COURT_IMG_H = int(round(COURT_IMG_W * (COURT_Y1 - COURT_Y0) / (COURT_X1 - COURT_X0)))
+# Full court: 94' length (same 50' width as half)
+FULL_COURT_Y0 = 0.0
+FULL_COURT_Y1 = 94.0
+FULL_COURT_IMG_W = 768
+FULL_COURT_IMG_H = int(
+    round(
+        FULL_COURT_IMG_W
+        * (FULL_COURT_Y1 - FULL_COURT_Y0)
+        / (COURT_X1 - COURT_X0)
+    )
+)
 # Inset mapping so baselines / 3pt lines aren’t clipped by thick strokes at bitmap edges
 COURT_VIEW_MARGIN_PX = 8
 
@@ -96,6 +107,13 @@ def clamp_court(x: float, y: float):
     return (
         max(COURT_X0, min(COURT_X1, x)),
         max(COURT_Y0, min(COURT_Y1, y)),
+    )
+
+
+def clamp_full_court(x: float, y: float) -> tuple[float, float]:
+    return (
+        max(COURT_X0, min(COURT_X1, x)),
+        max(FULL_COURT_Y0, min(FULL_COURT_Y1, y)),
     )
 
 
@@ -115,6 +133,37 @@ def pixel_to_court(px: float, py: float, w: int, h: int):
     x = COURT_X0 + ((px - m) / iw) * (COURT_X1 - COURT_X0)
     y = COURT_Y1 - ((py - m) / ih) * (COURT_Y1 - COURT_Y0)
     return clamp_court(x, y)
+
+
+def feet_to_pixel_full(x: float, y: float, w: int, h: int) -> tuple[float, float]:
+    m = COURT_VIEW_MARGIN_PX
+    iw = max(1, w - 2 * m)
+    ih = max(1, h - 2 * m)
+    px = (x - COURT_X0) / (COURT_X1 - COURT_X0) * iw + m
+    py = (FULL_COURT_Y1 - y) / (FULL_COURT_Y1 - FULL_COURT_Y0) * ih + m
+    return px, py
+
+
+def pixel_to_full_court(px: float, py: float, w: int, h: int) -> tuple[float, float]:
+    m = COURT_VIEW_MARGIN_PX
+    iw = max(1, w - 2 * m)
+    ih = max(1, h - 2 * m)
+    x = COURT_X0 + ((px - m) / iw) * (COURT_X1 - COURT_X0)
+    y = FULL_COURT_Y1 - ((py - m) / ih) * (FULL_COURT_Y1 - FULL_COURT_Y0)
+    return clamp_full_court(x, y)
+
+
+def native_px_from_image_click(
+    picked: dict, native_w: int, native_h: int
+) -> tuple[float, float]:
+    """Map streamlit_image_coordinates click to native bitmap pixels when the image is scaled to the column."""
+    x = float(picked["x"])
+    y = float(picked["y"])
+    w = float(picked.get("width") or native_w)
+    h = float(picked.get("height") or native_h)
+    if w <= 0 or h <= 0:
+        return x, y
+    return x * native_w / w, y * native_h / h
 
 
 # Tap-to-identify: max distance in feet from click to a shot (jump point or layup path)
@@ -320,8 +369,48 @@ def build_nba_halfcourt_image(w: int, h: int) -> Image.Image:
     return img
 
 
+def build_nba_fullcourt_image(w: int, h: int) -> Image.Image:
+    """Full 94' court (top view): mirrored regulation halves + midcourt + center circle."""
+    h_half = max(2, h // 2)
+    half = build_nba_halfcourt_image(w, h_half)
+    top = half.transpose(Image.FLIP_TOP_BOTTOM)
+    floor = (26, 47, 74)
+    full = Image.new("RGB", (w, h), floor)
+    full.paste(top, (0, 0))
+    full.paste(half, (0, h_half))
+    dr = ImageDraw.Draw(full)
+    mid_y = h // 2
+    dr.line([(0, mid_y), (w, mid_y)], fill="#ffffff", width=4)
+
+    t_c = np.linspace(0, 2 * np.pi, 56)
+    circ_pts = []
+    for ti in t_c:
+        px, py = feet_to_pixel_full(
+            6.0 * float(np.cos(ti)),
+            47.0 + 6.0 * float(np.sin(ti)),
+            w,
+            h,
+        )
+        circ_pts.extend([px, py])
+    if len(circ_pts) >= 4:
+        dr.line(circ_pts, fill="#ffffff", width=3)
+
+    try:
+        font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", 12)
+    except OSError:
+        font = ImageFont.load_default()
+    label = "NBA · regulation full court (top view)"
+    if hasattr(dr, "textbbox"):
+        bbox = dr.textbbox((0, 0), label, font=font)
+        tw = bbox[2] - bbox[0]
+    else:
+        tw, _ = dr.textsize(label, font=font)
+    dr.text(((w - tw) // 2, 6), label, fill=(190, 200, 215), font=font)
+    return full
+
+
 # Bump to invalidate @st.cache_data on Streamlit Cloud when court graphics change.
-_COURT_BITMAP_CACHE_VERSION = 4
+_COURT_BITMAP_CACHE_VERSION = 5
 
 
 @st.cache_data(show_spinner=False)
@@ -329,6 +418,14 @@ def _nba_halfcourt_png_bytes(width: int, height: int, _cache_v: int) -> bytes:
     """Always build from `build_nba_halfcourt_image` (top-down). Do not load PNG files here — Cloud
     caches were still serving an old 3/4 asset for some users."""
     img = build_nba_halfcourt_image(width, height)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", compress_level=3)
+    return buf.getvalue()
+
+
+@st.cache_data(show_spinner=False)
+def _nba_fullcourt_png_bytes(width: int, height: int, _cache_v: int) -> bytes:
+    img = build_nba_fullcourt_image(width, height)
     buf = io.BytesIO()
     img.save(buf, format="PNG", compress_level=3)
     return buf.getvalue()
@@ -353,6 +450,27 @@ def get_nba_halfcourt_rgb(width: int, height: int) -> Image.Image:
     return Image.open(
         io.BytesIO(
             _nba_halfcourt_png_bytes(width, height, _COURT_BITMAP_CACHE_VERSION)
+        )
+    ).convert("RGB")
+
+
+@lru_cache(maxsize=4)
+def _base_fullcourt_rgb_cached(_cache_v: int) -> Image.Image:
+    return Image.open(
+        io.BytesIO(
+            _nba_fullcourt_png_bytes(
+                FULL_COURT_IMG_W, FULL_COURT_IMG_H, _cache_v
+            )
+        )
+    ).convert("RGB")
+
+
+def get_nba_fullcourt_rgb(width: int, height: int) -> Image.Image:
+    if width == FULL_COURT_IMG_W and height == FULL_COURT_IMG_H:
+        return _base_fullcourt_rgb_cached(_COURT_BITMAP_CACHE_VERSION)
+    return Image.open(
+        io.BytesIO(
+            _nba_fullcourt_png_bytes(width, height, _COURT_BITMAP_CACHE_VERSION)
         )
     ).convert("RGB")
 
@@ -622,6 +740,72 @@ def composite_court_with_shots(
     return img.convert("RGB")
 
 
+def composite_full_court_coach(
+    base: Image.Image,
+    w: int,
+    h: int,
+    markers: list[dict],
+    pending_court_xy: tuple[float, float] | None = None,
+) -> Image.Image:
+    """Draw numbered player markers; same (x,y) stacks with vertical pixel offset."""
+    from collections import defaultdict
+
+    img = base.copy()
+    dr = ImageDraw.Draw(img, "RGBA")
+
+    groups: dict[tuple[float, float], list[tuple[int, dict]]] = defaultdict(list)
+    for i, m in enumerate(markers):
+        key = (round(float(m["x"]), 5), round(float(m["y"]), 5))
+        groups[key].append((i, m))
+
+    try:
+        font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", 13)
+    except OSError:
+        font = ImageFont.load_default()
+
+    for _key, items in groups.items():
+        x0, y0 = items[0][1]["x"], items[0][1]["y"]
+        px0, py0 = feet_to_pixel_full(float(x0), float(y0), w, h)
+        for stack_i, (_ii, m) in enumerate(items):
+            cy = py0 - stack_i * 16
+            cx = px0
+            num = str(m.get("number", "?")).strip() or "?"
+            r = 17
+            dr.ellipse(
+                (cx - r, cy - r, cx + r, cy + r),
+                fill=(55, 130, 210, 235),
+                outline=(255, 255, 255, 255),
+                width=2,
+            )
+            if hasattr(dr, "textbbox"):
+                bbox = dr.textbbox((0, 0), num, font=font)
+                tw = bbox[2] - bbox[0]
+                th = bbox[3] - bbox[1]
+            else:
+                tw, th = dr.textsize(num, font=font)
+            dr.text(
+                (cx - tw / 2, cy - th / 2),
+                num,
+                fill=(255, 255, 255, 255),
+                font=font,
+            )
+
+    if pending_court_xy is not None:
+        px, py = feet_to_pixel_full(
+            float(pending_court_xy[0]), float(pending_court_xy[1]), w, h
+        )
+        r = 22
+        dr.ellipse(
+            (px - r, py - r, px + r, py + r),
+            outline=(251, 191, 36, 255),
+            width=4,
+        )
+        dr.line([(px - 8, py), (px + 8, py)], fill=(251, 191, 36, 255), width=2)
+        dr.line([(px, py - 8), (px, py + 8)], fill=(251, 191, 36, 255), width=2)
+
+    return img.convert("RGB")
+
+
 def path_length_feet(pts: list[tuple[float, float]]) -> float:
     s = 0.0
     for a, b in zip(pts, pts[1:]):
@@ -678,6 +862,13 @@ def init_state():
     st.session_state.setdefault("session_subview", "court")
     st.session_state.setdefault("coach_chat_by_sheet", {})
     st.session_state.setdefault("home_sheets_expanded", False)
+    st.session_state.setdefault("home_dashboard_view", "player")
+    st.session_state.setdefault("coach_sheets", [])
+    st.session_state.setdefault("coach_active_sheet", None)
+    st.session_state.setdefault("coach_side", "offence")
+    st.session_state.setdefault("coach_markers", {})
+    st.session_state.setdefault("coach_marker_seq", 1)
+    st.session_state.setdefault("coach_pending", None)
     if "base44" not in st.session_state:
         st.session_state.base44 = Base44()
 
@@ -733,6 +924,250 @@ def _render_home_sheet_cell(sheet: str, idx: int, shots_today_list: list) -> Non
         st.session_state.active_session = sheet
         st.session_state.session_subview = "court"
         st.rerun()
+
+
+def _coach_markers_storage_key(sheet: str, side: str) -> str:
+    return f"{sheet}|{side}"
+
+
+def _normalize_coach_sheet_name(raw: str) -> str:
+    raw = raw.strip()
+    if not raw:
+        return ""
+    slug = re.sub(r"\s+", "_", raw)
+    slug = re.sub(r"[^\w\-]", "", slug)
+    if not slug:
+        return ""
+    if not slug.lower().startswith("play_"):
+        slug = "play_" + slug
+    return slug[:80]
+
+
+def _render_coach_dashboard() -> None:
+    """Full-court play designer: `play_*` sheets, offence/defence, stacked numbered markers."""
+    st.subheader("Coach view")
+    st.caption(
+        "Play sheets are saved as **play_…** names. Tap the full court to add a marker, "
+        "enter a jersey number, then **Place marker**. Same spot can hold unlimited stacked markers."
+    )
+
+    hdr_l, hdr_r = st.columns([4, 1])
+    with hdr_l:
+        side_now = st.session_state.get("coach_side", "offence")
+        st.markdown(
+            f"**Mode:** **{side_now.capitalize()}** — markers are separate for offence vs defence."
+        )
+    with hdr_r:
+        tgt = "Defence" if side_now == "offence" else "Offence"
+        if st.button(
+            f"Switch to {tgt}",
+            key="coach_side_toggle",
+            use_container_width=True,
+        ):
+            st.session_state.coach_side = "defence" if side_now == "offence" else "offence"
+            st.session_state.coach_pending = None
+            st.rerun()
+
+    add_l, add_r = st.columns([4, 1])
+    with add_l:
+        raw_new = st.text_input(
+            "New play sheet",
+            placeholder="e.g. horns (saved as play_horns)",
+            key="coach_new_play_name",
+        )
+    with add_r:
+        st.write("")
+        if st.button("Add play sheet", key="coach_add_play", use_container_width=True):
+            name = _normalize_coach_sheet_name(raw_new)
+            if name:
+                if name not in st.session_state.coach_sheets:
+                    st.session_state.coach_sheets.append(name)
+                st.session_state.coach_active_sheet = name
+                st.session_state.coach_pending = None
+                st.rerun()
+
+    sheets = list(st.session_state.coach_sheets)
+    if not sheets:
+        st.info(
+            "Add a play sheet above. Every sheet name starts with **play_** "
+            "(the prefix is added automatically if you omit it)."
+        )
+        return
+
+    prev_sheet = st.session_state.get("_coach_ui_prev_sheet")
+    pick = st.selectbox("Play sheet", options=sheets, key="coach_sheet_select")
+    if prev_sheet != pick:
+        st.session_state.coach_pending = None
+    st.session_state._coach_ui_prev_sheet = pick
+    st.session_state.coach_active_sheet = pick
+
+    side = st.session_state.get("coach_side", "offence")
+    mk = _coach_markers_storage_key(pick, side)
+    if mk not in st.session_state.coach_markers:
+        st.session_state.coach_markers[mk] = []
+    markers: list = st.session_state.coach_markers[mk]
+
+    pending = st.session_state.get("coach_pending")
+
+    base = get_nba_fullcourt_rgb(FULL_COURT_IMG_W, FULL_COURT_IMG_H)
+    court_rgb = composite_full_court_coach(
+        base,
+        FULL_COURT_IMG_W,
+        FULL_COURT_IMG_H,
+        markers,
+        pending_court_xy=(float(pending["x"]), float(pending["y"]))
+        if isinstance(pending, dict) and "x" in pending
+        else None,
+    )
+
+    st.caption(
+        "Tap the full court to pick a spot. Enter the jersey # under the court, then **Place marker**."
+    )
+
+    dedup_k = f"_coach_fc_dedup_{pick}_{side}"
+    picked = streamlit_image_coordinates(
+        court_rgb,
+        width=FULL_COURT_IMG_W,
+        height=FULL_COURT_IMG_H,
+        key=f"coach_fc_img_{pick}_{side}",
+        use_column_width="always",
+    )
+    if picked is not None and not pending:
+        nx, ny = native_px_from_image_click(
+            picked, FULL_COURT_IMG_W, FULL_COURT_IMG_H
+        )
+        cx, cy = pixel_to_full_court(nx, ny, FULL_COURT_IMG_W, FULL_COURT_IMG_H)
+        txy = (int(round(nx)), int(round(ny)))
+        if st.session_state.get(dedup_k) != txy:
+            st.session_state[dedup_k] = txy
+            st.session_state.coach_pending = {"x": cx, "y": cy}
+            st.rerun()
+
+    if pending:
+        st.text_input(
+            "Jersey # (saved on the marker)",
+            key="coach_jersey_txt",
+            max_chars=6,
+            placeholder="e.g. 23",
+        )
+        p1, p2 = st.columns(2)
+        place_key = f"coach_place_{mk}"
+        cancel_key = f"coach_cancel_{mk}"
+        if p1.button("Place marker", type="primary", key=place_key):
+            num = str(st.session_state.get("coach_jersey_txt", "")).strip() or "?"
+            nid = int(st.session_state.get("coach_marker_seq", 1))
+            st.session_state.coach_marker_seq = nid + 1
+            markers.append(
+                {
+                    "id": nid,
+                    "x": float(pending["x"]),
+                    "y": float(pending["y"]),
+                    "number": num,
+                }
+            )
+            st.session_state.coach_markers[mk] = markers
+            st.session_state.coach_pending = None
+            st.session_state.pop("coach_jersey_txt", None)
+            st.rerun()
+        if p2.button("Cancel", key=cancel_key):
+            st.session_state.coach_pending = None
+            st.session_state.pop("coach_jersey_txt", None)
+            st.rerun()
+
+    u1, u2 = st.columns(2)
+    if u1.button("Undo last marker", key="coach_undo_mk", disabled=len(markers) == 0):
+        markers.pop()
+        st.session_state.coach_markers[mk] = markers
+        st.rerun()
+    if u2.button("Clear markers (this sheet · this mode)", key="coach_clear_mk"):
+        st.session_state.coach_markers[mk] = []
+        st.session_state.coach_pending = None
+        st.rerun()
+
+
+def _render_player_dashboard(shots_today_list: list) -> None:
+    """Home dashboard: today’s stats, sheet grid, recent shots."""
+    st.subheader("Player view")
+    st.subheader("Today’s overview")
+
+    made_all = sum(1 for s in shots_today_list if s["result"] == "made")
+    miss_all = sum(1 for s in shots_today_list if s["result"] == "missed")
+    total = made_all + miss_all
+    pct = round(100 * made_all / total, 1) if total else 0.0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Shots today", total)
+    c2.metric("Made", made_all)
+    c3.metric("Missed", miss_all)
+    c4.metric("Accuracy", f"{pct}%")
+
+    st.subheader("Sheets")
+    st.caption(
+        "One row shows up to four sheets. **Open sheet** starts a session; "
+        "use **⋯** below if you have more than four."
+    )
+    sheet_names = list(st.session_state.sheets)
+    if not sheet_names:
+        st.caption("No sheets — add one in the sidebar.")
+    else:
+        row_a = sheet_names[:4]
+        cols = st.columns(4)
+        for i in range(4):
+            with cols[i]:
+                if i < len(row_a):
+                    _render_home_sheet_cell(row_a[i], i, shots_today_list)
+
+        if len(sheet_names) > 4:
+            n_extra = len(sheet_names) - 4
+            expanded = st.session_state.get("home_sheets_expanded", False)
+            if not expanded:
+                _e1, _e2, _e3 = st.columns([1, 2, 1])
+                with _e2:
+                    label = f"⋯  {n_extra} more sheet{'s' if n_extra != 1 else ''}"
+                    if st.button(
+                        label,
+                        key="home_expand_sheets",
+                        use_container_width=True,
+                        help="Show additional sheets",
+                    ):
+                        st.session_state.home_sheets_expanded = True
+                        st.rerun()
+            else:
+                st.divider()
+                rest = sheet_names[4:]
+                for row_start in range(0, len(rest), 4):
+                    chunk = rest[row_start : row_start + 4]
+                    rcols = st.columns(4)
+                    for j, sheet in enumerate(chunk):
+                        gidx = 4 + row_start + j
+                        with rcols[j]:
+                            _render_home_sheet_cell(sheet, gidx, shots_today_list)
+                _c1, _c2, _c3 = st.columns([1, 2, 1])
+                with _c2:
+                    if st.button(
+                        "Show less",
+                        key="home_collapse_sheets",
+                        use_container_width=True,
+                    ):
+                        st.session_state.home_sheets_expanded = False
+                        st.rerun()
+
+    st.subheader("Recent (all sheets)")
+    recent = shots_today_list[:12]
+    if not recent:
+        st.caption("No shots logged yet today.")
+    else:
+        for shot in recent:
+            sheet = shot.get("session_name", "—")
+            if shot.get("shot_kind") == "layup":
+                n = len(layup_path_to_pairs(shot.get("layup_path") or []))
+                loc = f" layup ({n} pts)"
+            else:
+                cx, cy = shot.get("court_x"), shot.get("court_y")
+                loc = f" ({cx:.0f},{cy:.0f} ft)" if cx is not None and cy is not None else ""
+            st.write(
+                f"**{shot['created_date'].strftime('%H:%M')}** · {sheet}{loc} · **{shot['result']}**"
+            )
 
 
 def split_shots_for_map(today_shots: list):
@@ -1470,34 +1905,32 @@ def _render_active_session(active_sheet: str) -> None:
             pending,
             inspect_shot=inspect_shot,
         )
-        _pad_j1, _jump_mid, _pad_j2 = st.columns([1, 2, 1])
-        with _jump_mid:
-            st.caption(
-                "Tap the court — green = made, red = miss, gold = pending. "
-                "Tap near a marker to select a shot."
-            )
-            click_dedup = f"_court_click_{active_sheet}"
-            picked = streamlit_image_coordinates(
-                court_map_img,
-                width=COURT_IMG_W,
-                height=COURT_IMG_H,
-                key=f"jump_img_{active_sheet}",
-            )
-            if picked is not None:
-                txy = (int(picked["x"]), int(picked["y"]))
-                if st.session_state.get(click_dedup) != txy:
-                    st.session_state[click_dedup] = txy
-                    cx, cy = pixel_to_court(
-                        float(txy[0]), float(txy[1]), COURT_IMG_W, COURT_IMG_H
-                    )
-                    hit = find_shot_near_court_click(today_shots, cx, cy)
-                    if hit is not None:
-                        st.session_state.court_inspect_id = hit["id"]
-                        st.session_state.pending_shot = None
-                    else:
-                        st.session_state.court_inspect_id = None
-                        st.session_state.pending_shot = (cx, cy)
-                    st.rerun()
+        st.caption(
+            "Tap the court — green = made, red = miss, gold = pending. "
+            "Tap near a marker to select a shot."
+        )
+        click_dedup = f"_court_click_{active_sheet}"
+        picked = streamlit_image_coordinates(
+            court_map_img,
+            width=COURT_IMG_W,
+            height=COURT_IMG_H,
+            key=f"jump_img_{active_sheet}",
+            use_column_width="always",
+        )
+        if picked is not None:
+            nx, ny = native_px_from_image_click(picked, COURT_IMG_W, COURT_IMG_H)
+            txy = (int(round(nx)), int(round(ny)))
+            if st.session_state.get(click_dedup) != txy:
+                st.session_state[click_dedup] = txy
+                cx, cy = pixel_to_court(nx, ny, COURT_IMG_W, COURT_IMG_H)
+                hit = find_shot_near_court_click(today_shots, cx, cy)
+                if hit is not None:
+                    st.session_state.court_inspect_id = hit["id"]
+                    st.session_state.pending_shot = None
+                else:
+                    st.session_state.court_inspect_id = None
+                    st.session_state.pending_shot = (cx, cy)
+                st.rerun()
 
         if inspect_shot is not None:
             st.info(f"**Selected shot** · {format_shot_one_line(inspect_shot)}")
@@ -1569,30 +2002,28 @@ def _render_active_session(active_sheet: str) -> None:
             inspect_shot=inspect_shot,
             draft_layup_path=list(lay_pts),
         )
-        _pad_l, _mid, _pad_r = st.columns([1, 2, 1])
-        with _mid:
-            if len(lay_pts) == 1:
-                st.caption("Next: **tap** where the path bends (2nd dot).")
-            elif len(lay_pts) == 2:
-                st.caption("Next: **tap** the finish (3rd dot).")
-            else:
-                st.caption("All three dots set — log **Made** / **Missed**, or **Reset layup**.")
-            lay_click_dedup = f"_layup_three_click_{active_sheet}"
-            picked_l = streamlit_image_coordinates(
-                court_map_lay,
-                width=COURT_IMG_W,
-                height=COURT_IMG_H,
-                key=f"layup_three_img_{active_sheet}",
-            )
-            if picked_l is not None and len(lay_pts) < 3:
-                txy = (int(picked_l["x"]), int(picked_l["y"]))
-                if st.session_state.get(lay_click_dedup) != txy:
-                    st.session_state[lay_click_dedup] = txy
-                    cx, cy = pixel_to_court(
-                        float(txy[0]), float(txy[1]), COURT_IMG_W, COURT_IMG_H
-                    )
-                    lay_pts.append((cx, cy))
-                    st.rerun()
+        if len(lay_pts) == 1:
+            st.caption("Next: **tap** where the path bends (2nd dot).")
+        elif len(lay_pts) == 2:
+            st.caption("Next: **tap** the finish (3rd dot).")
+        else:
+            st.caption("All three dots set — log **Made** / **Missed**, or **Reset layup**.")
+        lay_click_dedup = f"_layup_three_click_{active_sheet}"
+        picked_l = streamlit_image_coordinates(
+            court_map_lay,
+            width=COURT_IMG_W,
+            height=COURT_IMG_H,
+            key=f"layup_three_img_{active_sheet}",
+            use_column_width="always",
+        )
+        if picked_l is not None and len(lay_pts) < 3:
+            nx, ny = native_px_from_image_click(picked_l, COURT_IMG_W, COURT_IMG_H)
+            txy = (int(round(nx)), int(round(ny)))
+            if st.session_state.get(lay_click_dedup) != txy:
+                st.session_state[lay_click_dedup] = txy
+                cx, cy = pixel_to_court(nx, ny, COURT_IMG_W, COURT_IMG_H)
+                lay_pts.append((cx, cy))
+                st.rerun()
 
         merged = [(float(a), float(b)) for a, b in lay_pts]
         has_route = (
@@ -1706,17 +2137,16 @@ def tracker_app():
                     st.session_state.pending_shot = None
                 st.rerun()
 
-    st.title("Hoop-X")
-    st.markdown(
-        '<p style="color:#9ca3af;font-size:1.05rem;margin-top:-0.5rem;">Basketball tracker</p>',
-        unsafe_allow_html=True,
-    )
-
     all_shots = base44.list_shots()
     shots_today_list = shots_today(all_shots)
     active_sheet = st.session_state.active_session
 
     if active_sheet:
+        st.title("Hoop-X")
+        st.markdown(
+            '<p style="color:#9ca3af;font-size:1.05rem;margin-top:-0.5rem;">Basketball tracker</p>',
+            unsafe_allow_html=True,
+        )
         if st.session_state.get("_last_active_sheet") != active_sheet:
             st.session_state.pending_shot = None
             st.session_state.court_inspect_id = None
@@ -1750,86 +2180,36 @@ def tracker_app():
     st.session_state._last_active_sheet = None
     st.session_state._last_shot_mode = None
 
-    st.subheader("Today’s overview")
+    home_l, home_r = st.columns([5, 1])
+    with home_l:
+        st.title("Hoop-X")
+        st.markdown(
+            '<p style="color:#9ca3af;font-size:1.05rem;margin-top:-0.5rem;">Basketball tracker</p>',
+            unsafe_allow_html=True,
+        )
+    with home_r:
+        hv = st.session_state.get("home_dashboard_view", "player")
+        if hv == "player":
+            if st.button(
+                "Coach view",
+                key="dash_switch_coach",
+                use_container_width=True,
+            ):
+                st.session_state.home_dashboard_view = "coach"
+                st.rerun()
+        else:
+            if st.button(
+                "Player view",
+                key="dash_switch_player",
+                use_container_width=True,
+            ):
+                st.session_state.home_dashboard_view = "player"
+                st.rerun()
 
-    made_all = sum(1 for s in shots_today_list if s["result"] == "made")
-    miss_all = sum(1 for s in shots_today_list if s["result"] == "missed")
-    total = made_all + miss_all
-    pct = round(100 * made_all / total, 1) if total else 0.0
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Shots today", total)
-    c2.metric("Made", made_all)
-    c3.metric("Missed", miss_all)
-    c4.metric("Accuracy", f"{pct}%")
-
-    st.subheader("Sheets")
-    st.caption(
-        "One row shows up to four sheets. **Open sheet** starts a session; "
-        "use **⋯** below if you have more than four."
-    )
-    sheet_names = list(st.session_state.sheets)
-    if not sheet_names:
-        st.caption("No sheets — add one in the sidebar.")
+    if st.session_state.get("home_dashboard_view", "player") == "coach":
+        _render_coach_dashboard()
     else:
-        row_a = sheet_names[:4]
-        cols = st.columns(4)
-        for i in range(4):
-            with cols[i]:
-                if i < len(row_a):
-                    _render_home_sheet_cell(row_a[i], i, shots_today_list)
-
-        if len(sheet_names) > 4:
-            n_extra = len(sheet_names) - 4
-            expanded = st.session_state.get("home_sheets_expanded", False)
-            if not expanded:
-                _e1, _e2, _e3 = st.columns([1, 2, 1])
-                with _e2:
-                    label = f"⋯  {n_extra} more sheet{'s' if n_extra != 1 else ''}"
-                    if st.button(
-                        label,
-                        key="home_expand_sheets",
-                        use_container_width=True,
-                        help="Show additional sheets",
-                    ):
-                        st.session_state.home_sheets_expanded = True
-                        st.rerun()
-            else:
-                st.divider()
-                rest = sheet_names[4:]
-                for row_start in range(0, len(rest), 4):
-                    chunk = rest[row_start : row_start + 4]
-                    rcols = st.columns(4)
-                    for j, sheet in enumerate(chunk):
-                        gidx = 4 + row_start + j
-                        with rcols[j]:
-                            _render_home_sheet_cell(sheet, gidx, shots_today_list)
-                _c1, _c2, _c3 = st.columns([1, 2, 1])
-                with _c2:
-                    if st.button(
-                        "Show less",
-                        key="home_collapse_sheets",
-                        use_container_width=True,
-                    ):
-                        st.session_state.home_sheets_expanded = False
-                        st.rerun()
-
-    st.subheader("Recent (all sheets)")
-    recent = shots_today_list[:12]
-    if not recent:
-        st.caption("No shots logged yet today.")
-    else:
-        for shot in recent:
-            sheet = shot.get("session_name", "—")
-            if shot.get("shot_kind") == "layup":
-                n = len(layup_path_to_pairs(shot.get("layup_path") or []))
-                loc = f" layup ({n} pts)"
-            else:
-                cx, cy = shot.get("court_x"), shot.get("court_y")
-                loc = f" ({cx:.0f},{cy:.0f} ft)" if cx is not None and cy is not None else ""
-            st.write(
-                f"**{shot['created_date'].strftime('%H:%M')}** · {sheet}{loc} · **{shot['result']}**"
-            )
+        _render_player_dashboard(shots_today_list)
 
 
 if __name__ == "__main__":
