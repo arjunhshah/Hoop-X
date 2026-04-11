@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
 import io
 import json
 import re
@@ -11,7 +12,6 @@ from pathlib import Path
 import streamlit as st
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-from streamlit_drawable_canvas import st_canvas
 from streamlit_image_coordinates import streamlit_image_coordinates
 
 DARK_CSS = """
@@ -82,6 +82,8 @@ RESTRICTED_R_FT = 4.0  # no-charge semicircle
 FT_CIRCLE_R_FT = 6.0
 # Minimum polyline length (ft) to log a layup — slightly below 1 ft so quick strokes still count
 MIN_LAYUP_PATH_FT = 0.65
+# First point of the 3-dot layup editor (Streamlit: tap twice more; web: drag then tap)
+LAYUP_THREE_START_FT = (0.0, 6.5)
 
 # Canvas / background size (50:47 court aspect; image is scaled to this)
 COURT_IMG_W = 512
@@ -532,20 +534,35 @@ def _layup_endpoint_dots(
 
 
 def _draw_draft_layup_path(dr: ImageDraw.ImageDraw, path: list, w: int, h: int) -> None:
-    """Current layup stroke (not yet saved) on the preview map."""
+    """3-dot layup draft on the preview map (1–3 points, gold path + distinct dots)."""
 
     def court_to_px(xy):
-        return feet_to_pixel(xy[0], xy[1], w, h)
+        return feet_to_pixel(float(xy[0]), float(xy[1]), w, h)
 
-    if len(path) < 2:
+    if len(path) < 1:
         return
-    pix = [court_to_px((float(a), float(b))) for a, b in path]
+    pix = [court_to_px(p) for p in path]
     gold = (250, 204, 21, 255)
     rim = (255, 255, 255, 230)
-    for i in range(len(pix) - 1):
-        dr.line([pix[i], pix[i + 1]], fill=gold, width=9)
-        dr.line([pix[i], pix[i + 1]], fill=rim, width=3)
-    _layup_endpoint_dots(dr, pix, w, None)
+    rdot = max(5.0, 6.5 * w / 560.0)
+    if len(pix) >= 2:
+        for i in range(len(pix) - 1):
+            dr.line([pix[i], pix[i + 1]], fill=gold, width=9)
+            dr.line([pix[i], pix[i + 1]], fill=rim, width=3)
+    fills = (
+        (255, 255, 245, 255),
+        (251, 191, 36, 255),
+        (250, 204, 21, 255),
+    )
+    ring = (255, 255, 255, 255)
+    for idx, (px, py) in enumerate(pix):
+        fill = fills[min(idx, 2)]
+        dr.ellipse(
+            (px - rdot, py - rdot, px + rdot, py + rdot),
+            fill=fill,
+            outline=ring,
+            width=max(1, int(round(2 * w / 560))),
+        )
 
 
 def composite_court_with_shots(
@@ -595,195 +612,13 @@ def composite_court_with_shots(
         px, py = court_to_px(pending_court_xy)
         _draw_jump_marker(img, dr, px, py, "pending")
 
-    if draft_layup_path is not None and len(draft_layup_path) >= 2:
+    if draft_layup_path is not None and len(draft_layup_path) >= 1:
         _draw_draft_layup_path(dr, draft_layup_path, w, h)
 
     if inspect_shot is not None:
         _draw_inspect_highlight(dr, inspect_shot, w, h)
 
     return img.convert("RGB")
-
-
-def normalize_fabric_path(raw):
-    """Fabric may store path as flat list, nested segments, or JSON string."""
-    if raw is None:
-        return []
-    if isinstance(raw, str):
-        s = raw.strip()
-        if s.startswith("[") or s.startswith("{"):
-            try:
-                parsed = json.loads(s)
-                return normalize_fabric_path(parsed)
-            except json.JSONDecodeError:
-                return []
-        return []
-    if isinstance(raw, list) and len(raw) > 0:
-        first = raw[0]
-        if isinstance(first, (list, tuple)):
-            flat: list = []
-            for seg in raw:
-                if isinstance(seg, (list, tuple)):
-                    for item in seg:
-                        flat.append(item)
-            return flat
-        return list(raw)
-    return []
-
-
-def fabric_path_to_pixel_points(path_cmds: list) -> list[tuple[float, float]]:
-    """Flatten Fabric.js path commands to pixel (x,y) vertices."""
-    path_cmds = normalize_fabric_path(path_cmds)
-    pts: list[tuple[float, float]] = []
-    i = 0
-    n = len(path_cmds)
-    while i < n:
-        op = path_cmds[i]
-        if isinstance(op, (int, float)):
-            i += 1
-            continue
-        op = str(op).upper() if isinstance(op, str) else op
-        if op in ("M", "L"):
-            if i + 2 < n:
-                try:
-                    pts.append((float(path_cmds[i + 1]), float(path_cmds[i + 2])))
-                except (TypeError, ValueError):
-                    pass
-            i += 3
-        elif op == "Q":
-            if i + 4 < n:
-                try:
-                    pts.append((float(path_cmds[i + 3]), float(path_cmds[i + 4])))
-                except (TypeError, ValueError):
-                    pass
-            i += 5
-        elif op == "C":
-            if i + 6 < n:
-                try:
-                    pts.append((float(path_cmds[i + 5]), float(path_cmds[i + 6])))
-                except (TypeError, ValueError):
-                    pass
-            i += 7
-        elif op == "Z":
-            i += 1
-        else:
-            i += 1
-    return pts
-
-
-def _safe_float(v, default: float = 0.0) -> float:
-    try:
-        if v is None:
-            return default
-        return float(v)
-    except (TypeError, ValueError):
-        return default
-
-
-def path_pixels_from_fabric_object(obj: dict, w: int, h: int) -> list[tuple[float, float]]:
-    """Path points in canvas pixel space; picks pathOffset transform vs raw when it maps better to the court."""
-    raw = obj.get("path")
-    pts = fabric_path_to_pixel_points(raw)
-    if len(pts) < 2:
-        return []
-
-    def _inside_ratio(pix_list):
-        if not pix_list:
-            return 0.0
-        n_in = 0
-        for px, py in pix_list:
-            cx, cy = pixel_to_court(px, py, w, h)
-            if COURT_X0 <= cx <= COURT_X1 and COURT_Y0 <= cy <= COURT_Y1:
-                n_in += 1
-        return n_in / len(pix_list)
-
-    po = obj.get("pathOffset")
-    if isinstance(po, dict) and ("x" in po or "y" in po):
-        ox = _safe_float(po.get("x"), 0.0)
-        oy = _safe_float(po.get("y"), 0.0)
-        left = _safe_float(obj.get("left"), 0.0)
-        top = _safe_float(obj.get("top"), 0.0)
-        sx = _safe_float(obj.get("scaleX"), 1.0) or 1.0
-        sy = _safe_float(obj.get("scaleY"), 1.0) or 1.0
-        adj = [(left + (px - ox) * sx, top + (py - oy) * sy) for px, py in pts]
-        if _inside_ratio(adj) >= _inside_ratio(pts):
-            return adj
-    return pts
-
-
-def decimate_court_points(court_pts: list[tuple[float, float]]) -> list[tuple[float, float]]:
-    if len(court_pts) < 2:
-        return court_pts
-    slim = [court_pts[0]]
-    for p in court_pts[1:]:
-        if (p[0] - slim[-1][0]) ** 2 + (p[1] - slim[-1][1]) ** 2 >= 0.15**2:
-            slim.append(p)
-    if len(slim) == 1 and len(court_pts) > 1:
-        slim.append(court_pts[-1])
-    return slim
-
-
-def canvas_state_to_court_paths(canvas_json, w: int, h: int) -> list[list[tuple[float, float]]]:
-    """Parse st_canvas json_data whether Streamlit passes a dict or JSON string."""
-    if canvas_json is None:
-        return []
-    data = canvas_json
-    if isinstance(data, str):
-        try:
-            data = json.loads(data)
-        except json.JSONDecodeError:
-            return []
-    if not isinstance(data, dict):
-        return []
-
-    raw_objects = data.get("objects")
-    if not isinstance(raw_objects, list):
-        # Fabric / component quirks: objects as str or dict would iterate wrong types → .get AttributeError
-        return []
-    objects = raw_objects
-    paths: list[list[tuple[float, float]]] = []
-    for obj in objects:
-        if not isinstance(obj, dict):
-            continue
-        if obj.get("type") != "path":
-            continue
-        pix = path_pixels_from_fabric_object(obj, w, h)
-        if len(pix) < 2:
-            continue
-        court_pts = [pixel_to_court(px, py, w, h) for px, py in pix]
-        court_pts = decimate_court_points(court_pts)
-        if len(court_pts) >= 2:
-            paths.append(court_pts)
-    return paths
-
-
-def merge_court_paths(paths: list[list[tuple[float, float]]], gap_ft: float = 6.0) -> list[tuple[float, float]]:
-    """Stitch multiple freedraw strokes in JSON order into one polyline."""
-    if not paths:
-        return []
-    if len(paths) == 1:
-        return list(paths[0])
-    out = list(paths[0])
-    for p in paths[1:]:
-        if len(p) < 1:
-            continue
-        d_fwd = float(np.hypot(p[0][0] - out[-1][0], p[0][1] - out[-1][1]))
-        d_rev = float(np.hypot(p[-1][0] - out[-1][0], p[-1][1] - out[-1][1]))
-        if d_fwd <= gap_ft:
-            out.extend(p[1:])
-        elif d_rev <= gap_ft and len(p) > 1:
-            out.extend(reversed(p[:-1]))
-        else:
-            out.extend(p)
-    return decimate_court_points(out) if len(out) >= 2 else out
-
-
-def merged_layup_from_canvas(canvas_json, w: int, h: int) -> list[tuple[float, float]]:
-    paths = canvas_state_to_court_paths(canvas_json, w, h)
-    if not paths:
-        return []
-    if len(paths) == 1:
-        return paths[0]
-    return merge_court_paths(paths)
 
 
 def path_length_feet(pts: list[tuple[float, float]]) -> float:
@@ -815,14 +650,31 @@ class Base44:
         self.shots = [s for s in self.shots if s["id"] != shot_id]
 
 
+def _layup_three_state_key(sheet: str) -> str:
+    return "layup3_" + hashlib.md5(sheet.encode("utf-8")).hexdigest()
+
+
+def layup_three_points(sheet: str) -> list:
+    k = _layup_three_state_key(sheet)
+    cur = st.session_state.get(k)
+    if not isinstance(cur, list) or len(cur) < 1:
+        st.session_state[k] = [tuple(LAYUP_THREE_START_FT)]
+        cur = st.session_state[k]
+    return cur
+
+
+def layup_three_reset(sheet: str) -> None:
+    st.session_state[_layup_three_state_key(sheet)] = [tuple(LAYUP_THREE_START_FT)]
+
+
 def init_state():
     st.session_state.setdefault("sheets", ["Practice", "Drills", "Game prep"])
     st.session_state.setdefault("active_session", None)
     st.session_state.setdefault("pending_shot", None)
     st.session_state.setdefault("_last_active_sheet", None)
-    st.session_state.setdefault("layup_canvas_key", 0)
     st.session_state.setdefault("_last_shot_mode", None)
     st.session_state.setdefault("court_inspect_id", None)
+    st.session_state.setdefault("session_subview", "court")
     if "base44" not in st.session_state:
         st.session_state.base44 = Base44()
 
@@ -896,7 +748,9 @@ def compute_sheet_skills(today_shots: list) -> dict:
     }
 
 
-def _skills_bar_chart_png(jk: float, lk: float, fk: float) -> bytes:
+def _skills_bar_chart_png(
+    jk: float, lk: float, fk: float, *, compact: bool = False
+) -> bytes:
     """Matplotlib render (jump/layup/FG use -1.0 when rate is undefined).
 
     Not st.cache_data: server-wide chart cache can confuse multi-user deployments
@@ -917,7 +771,11 @@ def _skills_bar_chart_png(jk: float, lk: float, fk: float) -> bytes:
         fg if fg is not None else 0.0,
     ]
     labels = ["Jump shot", "Layup", "Overall FG"]
-    fig, ax = plt.subplots(figsize=(5.2, 3.5))
+    figsize = (4.0, 2.45) if compact else (5.2, 3.5)
+    title_fs, ax_fs, ylab_fs, ytick_fs, ann_fs = (
+        (10, 8, 9, 7, 8) if compact else (11, 10, 10, 8, 9)
+    )
+    fig, ax = plt.subplots(figsize=figsize)
     fig.patch.set_facecolor("#0d0d0d")
     ax.set_facecolor("#111111")
     x = np.arange(len(labels), dtype=float)
@@ -925,16 +783,16 @@ def _skills_bar_chart_png(jk: float, lk: float, fk: float) -> bytes:
     colors = ["#4ade80", "#60a5fa", "#fbbf24"]
     bars = ax.bar(x, vals, bar_w, color=colors, edgecolor="#2a2a2a", linewidth=1)
     ax.set_xticks(x)
-    ax.set_xticklabels(labels, color="#d4d4d4", fontsize=10)
-    ax.set_ylabel("Field goal %", color="#a3a3a3", fontsize=10)
+    ax.set_xticklabels(labels, color="#d4d4d4", fontsize=ax_fs)
+    ax.set_ylabel("Field goal %", color="#a3a3a3", fontsize=ylab_fs)
     ax.set_ylim(0, 100)
     ax.set_yticks([0, 25, 50, 75, 100])
-    ax.tick_params(axis="y", colors="#888888", labelsize=8)
+    ax.tick_params(axis="y", colors="#888888", labelsize=ytick_fs)
     ax.grid(axis="y", color="#2a2a2a", linestyle="-", linewidth=0.6, alpha=0.95)
     ax.set_axisbelow(True)
     for spine in ax.spines.values():
         spine.set_color("#333333")
-    ax.set_title("Skills — today on this sheet", color="#e5e5e5", fontsize=11, pad=10)
+    ax.set_title("Skills — today on this sheet", color="#e5e5e5", fontsize=title_fs, pad=8 if compact else 10)
     for b, v, r in zip(bars, vals, raw):
         h = b.get_height()
         txt = "—" if r is None and v == 0.0 else f"{v:.0f}%"
@@ -946,7 +804,7 @@ def _skills_bar_chart_png(jk: float, lk: float, fk: float) -> bytes:
             ha="center",
             va="bottom",
             color="#e5e5e5",
-            fontsize=9,
+            fontsize=ann_fs,
         )
     plt.tight_layout()
     out = io.BytesIO()
@@ -955,7 +813,7 @@ def _skills_bar_chart_png(jk: float, lk: float, fk: float) -> bytes:
     return out.getvalue()
 
 
-def render_skills_chart(skills: dict) -> None:
+def render_skills_chart(skills: dict, *, compact: bool = False) -> None:
     """Bar chart of jump %, layup %, overall FG (today, this sheet)."""
 
     def _key(x: float | None) -> float:
@@ -972,7 +830,7 @@ def render_skills_chart(skills: dict) -> None:
     ]
     labels = ["Jump shot", "Layup", "Overall FG"]
     try:
-        buf = _skills_bar_chart_png(jk, lk, fk)
+        buf = _skills_bar_chart_png(jk, lk, fk, compact=compact)
         st.image(io.BytesIO(buf), use_container_width=True)
     except Exception:
         cj, cl, co = st.columns(3)
@@ -985,6 +843,222 @@ def render_skills_chart(skills: dict) -> None:
                 lab,
                 f"{v:.0f}%" if r is not None or v > 0 else "—",
             )
+
+
+def _running_fg_chart_png(today_shots: list) -> bytes | None:
+    """Line chart: running FG% through the session (chronological)."""
+    if len(today_shots) < 2:
+        return None
+    ordered = sorted(today_shots, key=lambda s: s["created_date"])
+    running: list[float] = []
+    made = 0
+    for i, s in enumerate(ordered, start=1):
+        if s["result"] == "made":
+            made += 1
+        running.append(100.0 * made / i)
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    xs = np.arange(1, len(running) + 1, dtype=float)
+    fig, ax = plt.subplots(figsize=(5.4, 2.9))
+    fig.patch.set_facecolor("#0d0d0d")
+    ax.set_facecolor("#111111")
+    ax.plot(xs, running, color="#fbbf24", linewidth=2.2, marker="o", markersize=4)
+    ax.fill_between(xs, running, alpha=0.12, color="#fbbf24")
+    ax.set_xlabel("Shot # (today)", color="#a3a3a3", fontsize=10)
+    ax.set_ylabel("Running FG %", color="#a3a3a3", fontsize=10)
+    ax.set_ylim(0, 100)
+    ax.set_xticks(xs)
+    ax.grid(axis="y", color="#2a2a2a", linestyle="-", linewidth=0.6, alpha=0.95)
+    ax.tick_params(axis="both", colors="#888888", labelsize=8)
+    for spine in ax.spines.values():
+        spine.set_color("#333333")
+    ax.set_title("Running accuracy — this sheet", color="#e5e5e5", fontsize=11, pad=10)
+    plt.tight_layout()
+    out = io.BytesIO()
+    fig.savefig(out, format="png", dpi=88, facecolor="#0d0d0d", bbox_inches="tight")
+    plt.close(fig)
+    return out.getvalue()
+
+
+def _jump_vs_layup_counts_chart_png(jump_total: int, layup_total: int) -> bytes:
+    """Horizontal bar: volume split jump vs layup (today, this sheet)."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    labels = ["Jump shots", "Layups"]
+    vals = [float(jump_total), float(layup_total)]
+    fig, ax = plt.subplots(figsize=(5.2, 2.2))
+    fig.patch.set_facecolor("#0d0d0d")
+    ax.set_facecolor("#111111")
+    y = np.arange(len(labels), dtype=float)
+    colors = ["#4ade80", "#60a5fa"]
+    ax.barh(y, vals, height=0.55, color=colors, edgecolor="#2a2a2a", linewidth=1)
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels, color="#d4d4d4", fontsize=10)
+    ax.set_xlabel("Attempts (today)", color="#a3a3a3", fontsize=9)
+    for spine in ax.spines.values():
+        spine.set_color("#333333")
+    ax.tick_params(axis="x", colors="#888888", labelsize=8)
+    ax.grid(axis="x", color="#2a2a2a", linestyle="-", linewidth=0.6, alpha=0.95)
+    ax.set_axisbelow(True)
+    ax.set_title("Volume by shot type", color="#e5e5e5", fontsize=11, pad=8)
+    for yi, v in zip(y, vals):
+        ax.annotate(
+            f"{int(v)}",
+            xy=(v, yi),
+            xytext=(4, 0),
+            textcoords="offset points",
+            va="center",
+            ha="left",
+            color="#e5e5e5",
+            fontsize=9,
+        )
+    plt.tight_layout()
+    out = io.BytesIO()
+    fig.savefig(out, format="png", dpi=88, facecolor="#0d0d0d", bbox_inches="tight")
+    plt.close(fig)
+    return out.getvalue()
+
+
+def build_coach_feedback(
+    skills: dict,
+    sheet_name: str,
+    overall_total: int,
+) -> str:
+    """Rule-based coaching copy from today’s sheet stats (no external API)."""
+    tt = skills["total"]
+    fg = skills["fg_pct"]
+    jp, lp = skills["jump_pct"], skills["layup_pct"]
+    jt, lt = skills["jump_total"], skills["layup_total"]
+
+    if tt == 0:
+        return (
+            f"**{sheet_name}** has no shots logged today yet. "
+            "Use **Court session** and record makes and misses — I will highlight patterns once you have data."
+        )
+
+    lines: list[str] = [f"### AI coach · **{sheet_name}**"]
+    if fg is not None:
+        if fg >= 55:
+            lines.append(
+                f"- **Strong stretch:** {fg:.0f}% overall on this sheet — keep the same prep and pace between shots."
+            )
+        elif fg >= 45:
+            lines.append(
+                f"- **Solid:** {fg:.0f}% is a workable clip. If legs fade, move a step in before forcing deep range."
+            )
+        else:
+            lines.append(
+                f"- **Build back up:** {fg:.0f}% says favor high-percentage looks and form reps before stretching the defense."
+            )
+
+    if tt < 8:
+        lines.append(
+            "- **Sample size:** A few more attempts will make jump vs. layup comparisons more reliable."
+        )
+
+    if jt >= 3 and lt >= 3 and jp is not None and lp is not None:
+        if jp > lp + 15:
+            lines.append(
+                "- **Jumpers ahead:** Your jump FG is outpacing layups today — keep finishing drills sharp at the rim too."
+            )
+        elif lp > jp + 15:
+            lines.append(
+                "- **Finishing well:** Layups are carrying you — if jumpers feel off, add short rhythm shots from the nail or elbows."
+            )
+        elif abs(jp - lp) <= 10:
+            lines.append(
+                "- **Balanced:** Jump and layup rates are close — a good sign for all-around scoring."
+            )
+
+    if jt == 0 and lt > 0:
+        lines.append(
+            "- **Layups only so far:** When you can, log jump shots here to track full scoring profile."
+        )
+    if lt == 0 and jt > 0:
+        lines.append(
+            "- **Jumpers only so far:** Add layup finishes to see rim efficiency on this sheet."
+        )
+
+    if overall_total > 0:
+        share = 100.0 * tt / overall_total
+        if share >= 50:
+            lines.append(
+                f"- **Today’s focus:** This sheet is most of your volume (~{share:.0f}% of today’s shots) — trends here matter."
+            )
+        elif share < 25 and overall_total >= 10:
+            lines.append(
+                "- **Spread workload:** You are splitting the day across sheets — compare numbers on the home overview."
+            )
+
+    return "\n".join(lines)
+
+
+def _render_skills_page(active_sheet: str) -> None:
+    base44 = get_base44()
+    all_shots = base44.list_shots()
+    today_iso_s = today_iso()
+    today_shots = [
+        s
+        for s in all_shots
+        if s["created_date"].date().isoformat() == today_iso_s
+        and s.get("session_name") == active_sheet
+    ]
+    all_today = shots_today(all_shots)
+    overall_made = sum(1 for s in all_today if s["result"] == "made")
+    overall_miss = sum(1 for s in all_today if s["result"] == "missed")
+    overall_total = overall_made + overall_miss
+    overall_pct = round(100 * overall_made / overall_total, 1) if overall_total else 0.0
+
+    made = sum(1 for s in today_shots if s["result"] == "made")
+    missed = sum(1 for s in today_shots if s["result"] == "missed")
+    skills = compute_sheet_skills(today_shots)
+
+    st.subheader(f"Skills & analytics · {active_sheet}")
+
+    st.write("##### This sheet today")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Made", made)
+    m2.metric("Missed", missed)
+    fg_label = f"{skills['fg_pct']:.1f}%" if skills["fg_pct"] is not None else "—"
+    m3.metric("FG%", fg_label)
+    m4.metric("Shots", skills["total"])
+
+    st.write("##### Overall today (all sheets)")
+    o1, o2, o3, o4 = st.columns(4)
+    o1.metric("Shots (all)", overall_total)
+    o2.metric("Made (all)", overall_made)
+    o3.metric("Missed (all)", overall_miss)
+    o4.metric("FG% (all)", f"{overall_pct}%" if overall_total else "—")
+
+    ch_left, ch_right = st.columns(2)
+    with ch_left:
+        st.caption("Jump vs. layup vs. overall FG — this sheet")
+        render_skills_chart(skills, compact=False)
+    with ch_right:
+        st.caption("Attempts by type — this sheet")
+        try:
+            buf_v = _jump_vs_layup_counts_chart_png(
+                skills["jump_total"], skills["layup_total"]
+            )
+            st.image(io.BytesIO(buf_v), use_container_width=True)
+        except Exception:
+            st.caption("Chart unavailable.")
+
+    st.write("##### Session trend")
+    run_buf = _running_fg_chart_png(today_shots)
+    if run_buf is not None:
+        st.image(io.BytesIO(run_buf), use_container_width=True)
+    else:
+        st.caption("Log at least two shots on this sheet today to see a running FG% curve.")
+
+    st.write("##### AI coach")
+    st.markdown(build_coach_feedback(skills, active_sheet, overall_total))
 
 
 def _render_active_session(active_sheet: str) -> None:
@@ -1009,7 +1083,8 @@ def _render_active_session(active_sheet: str) -> None:
     if prev_mode is not None and prev_mode != shot_mode:
         st.session_state.pending_shot = None
         st.session_state.court_inspect_id = None
-        st.session_state.layup_canvas_key = int(st.session_state.layup_canvas_key) + 1
+        if shot_mode == "Layup":
+            layup_three_reset(active_sheet)
     st.session_state._last_shot_mode = shot_mode
 
     made = sum(1 for s in today_shots if s["result"] == "made")
@@ -1023,20 +1098,7 @@ def _render_active_session(active_sheet: str) -> None:
     fg_label = f"{skills['fg_pct']:.1f}%" if skills["fg_pct"] is not None else "—"
     m3.metric("FG%", fg_label)
 
-    st.write("##### Skills")
-    sk_l, sk_r = st.columns([1.15, 1])
-    with sk_l:
-        render_skills_chart(skills)
-    with sk_r:
-        st.caption(
-            "Jump vs layup vs overall field-goal rate on **this sheet** (today)."
-        )
-        st.caption(
-            f"Jump shots: **{skills['jump_made']}** / {skills['jump_total']} · "
-            f"Layups: **{skills['layup_made']}** / {skills['layup_total']} · "
-            f"Shots: **{skills['total']}**"
-        )
-
+    st.write("##### Court")
     jump_made, jump_miss, lay_made, lay_miss = split_shots_for_map(today_shots)
     pending = st.session_state.pending_shot
     if pending is not None:
@@ -1143,49 +1205,63 @@ def _render_active_session(active_sheet: str) -> None:
             st.rerun()
 
     else:
+        lay_pts = layup_three_points(active_sheet)
         st.caption(
-            "Draw your layup route, then tap **Sync stroke** so Made/Missed can read it "
-            "(avoids lag from updating on every brush movement)."
+            "**Layup (3 dots)** — Gold start is set. Tap the court for dot **2** (turn), then for dot **3** "
+            "(finish). **Reset layup** starts over. (Streamlit can’t drag; use the web app for drag-to-place dot 2.)"
         )
-        court_bg = get_nba_halfcourt_rgb(COURT_IMG_W, COURT_IMG_H).copy()
-        ckey = int(st.session_state.layup_canvas_key)
-        _pad_l, _court_col, _pad_r = st.columns([1, 2, 1])
-        with _court_col:
-            canvas_result = st_canvas(
-                fill_color="rgba(0, 0, 0, 0)",
-                stroke_width=4,
-                stroke_color="#f4d03f",
-                background_image=court_bg,
-                update_streamlit=False,
-                height=COURT_IMG_H,
+        court_map_lay = composite_court_with_shots(
+            get_nba_halfcourt_rgb(COURT_IMG_W, COURT_IMG_H),
+            COURT_IMG_W,
+            COURT_IMG_H,
+            jump_made,
+            jump_miss,
+            lay_made,
+            lay_miss,
+            pending_court_xy=None,
+            inspect_shot=inspect_shot,
+            draft_layup_path=list(lay_pts),
+        )
+        _pad_l, _mid, _pad_r = st.columns([1, 2, 1])
+        with _mid:
+            if len(lay_pts) == 1:
+                st.caption("Next: **tap** where the path bends (2nd dot).")
+            elif len(lay_pts) == 2:
+                st.caption("Next: **tap** the finish (3rd dot).")
+            else:
+                st.caption("All three dots set — log **Made** / **Missed**, or **Reset layup**.")
+            lay_click_dedup = f"_layup_three_click_{active_sheet}"
+            picked_l = streamlit_image_coordinates(
+                court_map_lay,
                 width=COURT_IMG_W,
-                drawing_mode="freedraw",
-                key=f"layup_canvas_{active_sheet}_{ckey}",
-                display_toolbar=True,
+                height=COURT_IMG_H,
+                key=f"layup_three_img_{active_sheet}",
             )
-            # Safe for None, or streamlit-drawable-canvas returning the class before first paint.
-            layup_json = getattr(canvas_result, "json_data", None)
-            merged = merged_layup_from_canvas(
-                layup_json, COURT_IMG_W, COURT_IMG_H
-            )
-        if st.button(
-            "Sync stroke",
-            key=f"layup_sync_{active_sheet}_{ckey}",
-            type="secondary",
-            help="Pulls your latest drawing into the app once (needed before Made/Missed).",
-        ):
-            st.rerun()
-        has_route = len(merged) >= 2 and path_length_feet(merged) >= MIN_LAYUP_PATH_FT
+            if picked_l is not None and len(lay_pts) < 3:
+                txy = (int(picked_l["x"]), int(picked_l["y"]))
+                if st.session_state.get(lay_click_dedup) != txy:
+                    st.session_state[lay_click_dedup] = txy
+                    cx, cy = pixel_to_court(
+                        float(txy[0]), float(txy[1]), COURT_IMG_W, COURT_IMG_H
+                    )
+                    lay_pts.append((cx, cy))
+                    st.rerun()
+
+        merged = [(float(a), float(b)) for a, b in lay_pts]
+        has_route = (
+            len(merged) == 3 and path_length_feet(merged) >= MIN_LAYUP_PATH_FT
+        )
 
         col_a, col_b, col_c = st.columns([1, 1, 1])
-        if col_a.button("Clear layup drawing", type="secondary"):
-            st.session_state.layup_canvas_key = ckey + 1
+        if col_a.button("Reset layup", type="secondary"):
+            layup_three_reset(active_sheet)
+            st.session_state.pop(f"_layup_three_click_{active_sheet}", None)
             st.rerun()
 
         log_made = col_b.button("Made", type="primary", disabled=not has_route)
         log_miss = col_c.button("Missed", type="secondary", disabled=not has_route)
 
-        lx, ly = merged[-1] if merged else (None, None)
+        lx, ly = merged[-1] if len(merged) >= 1 else (None, None)
         if log_made and has_route:
             base44.create_shot(
                 {
@@ -1200,7 +1276,8 @@ def _render_active_session(active_sheet: str) -> None:
                     "court_y": float(ly) if ly is not None else None,
                 }
             )
-            st.session_state.layup_canvas_key = ckey + 1
+            layup_three_reset(active_sheet)
+            st.session_state.pop(f"_layup_three_click_{active_sheet}", None)
             st.rerun()
         if log_miss and has_route:
             base44.create_shot(
@@ -1216,7 +1293,8 @@ def _render_active_session(active_sheet: str) -> None:
                     "court_y": float(ly) if ly is not None else None,
                 }
             )
-            st.session_state.layup_canvas_key = ckey + 1
+            layup_three_reset(active_sheet)
+            st.session_state.pop(f"_layup_three_click_{active_sheet}", None)
             st.rerun()
 
     u1, u2 = st.columns(2)
@@ -1243,7 +1321,7 @@ def _render_active_session(active_sheet: str) -> None:
 
 def tracker_app():
     st.set_page_config(
-        page_title="Swish",
+        page_title="Hoop-X",
         page_icon="🏀",
         layout="wide",
         initial_sidebar_state="expanded",
@@ -1281,7 +1359,7 @@ def tracker_app():
                     st.session_state.pending_shot = None
                 st.rerun()
 
-    st.title("Swish")
+    st.title("Hoop-X")
     st.markdown(
         '<p style="color:#9ca3af;font-size:1.05rem;margin-top:-0.5rem;">Basketball tracker</p>',
         unsafe_allow_html=True,
@@ -1297,14 +1375,29 @@ def tracker_app():
             st.session_state.court_inspect_id = None
         st.session_state._last_active_sheet = active_sheet
 
-        if st.button("← All sheets", type="secondary"):
-            st.session_state.active_session = None
-            st.session_state.pending_shot = None
-            st.session_state.court_inspect_id = None
-            st.session_state._last_active_sheet = None
-            st.rerun()
+        nav_left, _nav_mid, nav_right = st.columns([1, 4, 1])
+        with nav_left:
+            if st.button("← All sheets", type="secondary"):
+                st.session_state.active_session = None
+                st.session_state.pending_shot = None
+                st.session_state.court_inspect_id = None
+                st.session_state._last_active_sheet = None
+                st.session_state.session_subview = "court"
+                st.rerun()
+        with nav_right:
+            if st.session_state.get("session_subview") == "skills":
+                if st.button("← Court", type="primary", use_container_width=True):
+                    st.session_state.session_subview = "court"
+                    st.rerun()
+            else:
+                if st.button("Skills & coach", type="secondary", use_container_width=True):
+                    st.session_state.session_subview = "skills"
+                    st.rerun()
 
-        _render_active_session(active_sheet)
+        if st.session_state.get("session_subview") == "skills":
+            _render_skills_page(active_sheet)
+        else:
+            _render_active_session(active_sheet)
         return
 
     st.session_state._last_active_sheet = None
@@ -1373,6 +1466,7 @@ def tracker_app():
                             use_container_width=True,
                         ):
                             st.session_state.active_session = sheet
+                            st.session_state.session_subview = "court"
                             st.rerun()
 
     st.subheader("Recent (all sheets)")

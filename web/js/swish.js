@@ -1,5 +1,5 @@
 /**
- * Swish web — half court, sheets, localStorage
+ * Hoop-X web — half court, sheets, localStorage
  */
 (function () {
   "use strict";
@@ -21,6 +21,10 @@
   const COURT_W = 512;
   const COURT_H = Math.round((COURT_W * (COURT_Y1 - COURT_Y0)) / (COURT_X1 - COURT_X0));
   const COURT_MARGIN = 8;
+  /** Default first dot for 3-dot layup (matches Streamlit LAYUP_THREE_START_FT). */
+  const LAYUP_START_FT = [0, 6.5];
+  const LAYUP_GRAB_FT = 3.5;
+  const MIN_LAYUP_PATH_FT = 0.65;
   const PICK_JUMP = 3;
   const PICK_LAYUP = 4;
   const SHEET_CARD_W = 260;
@@ -31,7 +35,9 @@
   let activeSheet = null;
   let pendingJump = null;
   let inspectId = null;
-  let layupDraft = [];
+  let layupDraft = [LAYUP_START_FT.slice()];
+  let layupDragPreview = null;
+  let layupDragging = false;
   /** 0-based page index for the home sheet grid (3×3). */
   let sheetGridPage = 0;
   /** Loaded from `assets/halfcourt.png` (same artwork as Streamlit); falls back to vector court. */
@@ -93,7 +99,7 @@
         })
       );
     } catch (e) {
-      console.warn("Swish: could not save to localStorage", e);
+      console.warn("Hoop-X: could not save to localStorage", e);
     }
   }
 
@@ -423,6 +429,48 @@
     ctx.stroke();
   }
 
+  function drawLayupThreeDraft(ctx, pts, previewFt, w, h) {
+    if (!pts || pts.length < 1) return;
+    const pix = pts.map((p) => feetToPixel(p[0], p[1], w, h));
+    let segments = pix;
+    if (previewFt && pts.length === 1) {
+      const pr = feetToPixel(previewFt[0], previewFt[1], w, h);
+      segments = [pix[0], pr];
+    }
+    if (segments.length >= 2) {
+      ctx.strokeStyle = "rgba(250,204,21,0.98)";
+      ctx.lineWidth = 8 * (w / COURT_W);
+      ctx.beginPath();
+      ctx.moveTo(segments[0][0], segments[0][1]);
+      for (let i = 1; i < segments.length; i++)
+        ctx.lineTo(segments[i][0], segments[i][1]);
+      ctx.stroke();
+      ctx.strokeStyle = "rgba(255,255,255,0.75)";
+      ctx.lineWidth = 3 * (w / COURT_W);
+      ctx.beginPath();
+      ctx.moveTo(segments[0][0], segments[0][1]);
+      for (let i = 1; i < segments.length; i++)
+        ctx.lineTo(segments[i][0], segments[i][1]);
+      ctx.stroke();
+    }
+    const r = Math.max(5, 6.5 * (w / COURT_W));
+    const lw = Math.max(1.5, 2 * (w / COURT_W));
+    const fills = [
+      "rgba(255,255,245,0.98)",
+      "rgba(251,191,36,0.98)",
+      "rgba(250,204,21,0.98)",
+    ];
+    for (let i = 0; i < pix.length; i++) {
+      ctx.strokeStyle = "rgba(251,191,36,0.98)";
+      ctx.lineWidth = lw;
+      ctx.fillStyle = fills[Math.min(i, 2)];
+      ctx.beginPath();
+      ctx.arc(pix[i][0], pix[i][1], r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+    }
+  }
+
   function drawShotMap(
     ctx,
     w,
@@ -430,7 +478,8 @@
     todayShots,
     pending,
     inspectShot,
-    draftLayup
+    draftLayup,
+    layupPreviewFt
   ) {
     drawCourtBackground(ctx, w, h);
 
@@ -469,36 +518,8 @@
       drawJumpMarker(ctx, px, py, "pending");
     }
 
-    if (draftLayup && draftLayup.length >= 2) {
-      const pix = draftLayup.map((p) => feetToPixel(p[0], p[1], w, h));
-      ctx.strokeStyle = "rgba(250,204,21,0.98)";
-      ctx.lineWidth = 8 * (w / COURT_W);
-      ctx.beginPath();
-      ctx.moveTo(pix[0][0], pix[0][1]);
-      for (let i = 1; i < pix.length; i++) ctx.lineTo(pix[i][0], pix[i][1]);
-      ctx.stroke();
-      ctx.strokeStyle = "rgba(255,255,255,0.75)";
-      ctx.lineWidth = 3 * (w / COURT_W);
-      ctx.beginPath();
-      ctx.moveTo(pix[0][0], pix[0][1]);
-      for (let i = 1; i < pix.length; i++) ctx.lineTo(pix[i][0], pix[i][1]);
-      ctx.stroke();
-      const r = Math.max(5, 6 * (w / COURT_W));
-      const lw = Math.max(1.5, 2 * (w / COURT_W));
-      const start = pix[0];
-      const end = pix[pix.length - 1];
-      ctx.strokeStyle = "rgba(251,191,36,0.98)";
-      ctx.lineWidth = lw;
-      ctx.fillStyle = "rgba(255,255,255,0.95)";
-      ctx.beginPath();
-      ctx.arc(start[0], start[1], r, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.stroke();
-      ctx.fillStyle = "rgba(250,204,21,0.98)";
-      ctx.beginPath();
-      ctx.arc(end[0], end[1], r, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.stroke();
+    if (draftLayup && draftLayup.length >= 1) {
+      drawLayupThreeDraft(ctx, draftLayup, layupPreviewFt, w, h);
     }
 
     if (inspectShot) drawInspectRing(ctx, inspectShot, w, h);
@@ -521,8 +542,8 @@
 
   function setDocumentTitle() {
     document.title = activeSheet
-      ? `Swish · ${activeSheet}`
-      : "Swish — Basketball tracker";
+      ? `Hoop-X · ${activeSheet}`
+      : "Hoop-X — Basketball tracker";
   }
 
   function sessionSkillsHtml(today) {
@@ -656,7 +677,7 @@
       cv.width = SHEET_CARD_W;
       cv.height = cardH;
       const ctx = cv.getContext("2d");
-      drawShotMap(ctx, SHEET_CARD_W, cardH, sub, null, null, null);
+      drawShotMap(ctx, SHEET_CARD_W, cardH, sub, null, null, null, null);
       card.appendChild(cv);
       card.addEventListener("click", () => openSession(sheet));
       grid.appendChild(card);
@@ -738,7 +759,9 @@
     activeSheet = sheet;
     pendingJump = null;
     inspectId = null;
-    layupDraft = [];
+    layupDraft = [LAYUP_START_FT.slice()];
+    layupDragPreview = null;
+    layupDragging = false;
     document.getElementById("view-home").classList.remove("active");
     document.getElementById("view-session").classList.add("active");
     document.getElementById("session-title").textContent = "Session · " + sheet;
@@ -756,6 +779,11 @@
     });
     document.getElementById("jump-panel").classList.toggle("hidden", !jump);
     document.getElementById("layup-panel").classList.toggle("hidden", jump);
+    if (!jump) {
+      layupDraft = [LAYUP_START_FT.slice()];
+      layupDragPreview = null;
+      layupDragging = false;
+    }
     refreshSession();
   }
 
@@ -805,6 +833,7 @@
       today,
       pendingJump,
       inspectShot,
+      null,
       null
     );
 
@@ -819,7 +848,8 @@
       today,
       null,
       null,
-      layupDraft.length >= 2 ? layupDraft : null
+      layupDraft.length >= 1 ? layupDraft : null,
+      layupDraft.length === 1 && layupDragPreview ? layupDragPreview : null
     );
 
     const hasPending = pendingJump != null;
@@ -827,7 +857,7 @@
     document.getElementById("btn-miss").disabled = !hasPending;
 
     const layupLen = pathLengthFt(layupDraft);
-    const hasLayup = layupDraft.length >= 2 && layupLen >= 1;
+    const hasLayup = layupDraft.length === 3 && layupLen >= MIN_LAYUP_PATH_FT;
     document.getElementById("btn-lay-made").disabled = !hasLayup;
     document.getElementById("btn-lay-miss").disabled = !hasLayup;
 
@@ -894,7 +924,9 @@
     save();
     inspectId = null;
     pendingJump = null;
-    layupDraft = [];
+    layupDraft = [LAYUP_START_FT.slice()];
+    layupDragPreview = null;
+    layupDragging = false;
     refreshAll();
   }
 
@@ -909,7 +941,7 @@
     const url = cv.toDataURL("image/png");
     const a = document.createElement("a");
     a.href = url;
-    a.download = `swish_${safe || "court"}_${tag}_preview.png`;
+    a.download = `hoop_x_${safe || "court"}_${tag}_preview.png`;
     a.rel = "noopener";
     document.body.appendChild(a);
     a.click();
@@ -960,7 +992,9 @@
     save();
     inspectId = null;
     pendingJump = null;
-    layupDraft = [];
+    layupDraft = [LAYUP_START_FT.slice()];
+    layupDragPreview = null;
+    layupDragging = false;
     refreshAll();
   }
 
@@ -987,31 +1021,38 @@
     refreshSession();
   }
 
-  function bindLayupCanvas() {
+  function bindLayupThreePoint() {
     const cv = document.getElementById("layup-court");
-    let drawing = false;
-    const addPt = (clientX, clientY) => {
+    if (!cv) return;
+
+    function courtFromEvent(e) {
       const r = cv.getBoundingClientRect();
       const sx = cv.width / r.width;
       const sy = cv.height / r.height;
-      const px = (clientX - r.left) * sx;
-      const py = (clientY - r.top) * sy;
-      const next = pixelToCourt(px, py, cv.width, cv.height);
-      if (layupDraft.length) {
-        const last = layupDraft[layupDraft.length - 1];
-        if (Math.hypot(next[0] - last[0], next[1] - last[1]) < 0.35) return;
-      }
-      layupDraft.push(next);
-      refreshSession();
-    };
+      const px = (e.clientX - r.left) * sx;
+      const py = (e.clientY - r.top) * sy;
+      return pixelToCourt(px, py, cv.width, cv.height);
+    }
 
-    function endStroke(e) {
-      drawing = false;
+    function distFt(a, b) {
+      return Math.hypot(a[0] - b[0], a[1] - b[1]);
+    }
+
+    function endLayupDrag(e) {
+      if (!layupDragging) return;
+      layupDragging = false;
+      if (layupDraft.length === 1 && layupDragPreview) {
+        if (distFt(layupDragPreview, layupDraft[0]) >= 0.4) {
+          layupDraft.push(layupDragPreview.slice());
+        }
+      }
+      layupDragPreview = null;
       if (e && e.pointerId != null) {
         try {
           cv.releasePointerCapture(e.pointerId);
         } catch (err) {}
       }
+      refreshSession();
     }
 
     cv.addEventListener(
@@ -1020,26 +1061,37 @@
         if (!activeSheet) return;
         if (e.pointerType === "mouse" && e.button !== 0) return;
         e.preventDefault();
-        drawing = true;
-        layupDraft = [];
-        try {
-          cv.setPointerCapture(e.pointerId);
-        } catch (err) {}
-        addPt(e.clientX, e.clientY);
+        const p = courtFromEvent(e);
+        if (layupDraft.length === 1) {
+          if (distFt(p, layupDraft[0]) <= LAYUP_GRAB_FT) {
+            layupDragging = true;
+            layupDragPreview = p;
+            try {
+              cv.setPointerCapture(e.pointerId);
+            } catch (err) {}
+            refreshSession();
+          }
+        } else if (layupDraft.length === 2) {
+          layupDraft.push(p);
+          refreshSession();
+        }
       },
       { passive: false }
     );
+
     cv.addEventListener(
       "pointermove",
       (e) => {
-        if (!drawing) return;
+        if (!layupDragging || layupDraft.length !== 1) return;
         e.preventDefault();
-        addPt(e.clientX, e.clientY);
+        layupDragPreview = courtFromEvent(e);
+        refreshSession();
       },
       { passive: false }
     );
-    cv.addEventListener("pointerup", endStroke);
-    cv.addEventListener("pointercancel", endStroke);
+
+    cv.addEventListener("pointerup", endLayupDrag);
+    cv.addEventListener("pointercancel", endLayupDrag);
   }
 
   function init() {
@@ -1108,12 +1160,15 @@
       refreshAll();
     });
     document.getElementById("btn-clear-layup").addEventListener("click", () => {
-      layupDraft = [];
+      layupDraft = [LAYUP_START_FT.slice()];
+      layupDragPreview = null;
+      layupDragging = false;
       refreshSession();
     });
     document.getElementById("btn-lay-made").addEventListener("click", () => {
-      if (!activeSheet || layupDraft.length < 2) return;
-      const last = layupDraft[layupDraft.length - 1];
+      if (!activeSheet || layupDraft.length !== 3) return;
+      if (pathLengthFt(layupDraft) < MIN_LAYUP_PATH_FT) return;
+      const last = layupDraft[2];
       addShot({
         session_name: activeSheet,
         result: "made",
@@ -1122,12 +1177,15 @@
         court_x: last[0],
         court_y: last[1],
       });
-      layupDraft = [];
+      layupDraft = [LAYUP_START_FT.slice()];
+      layupDragPreview = null;
+      layupDragging = false;
       refreshAll();
     });
     document.getElementById("btn-lay-miss").addEventListener("click", () => {
-      if (!activeSheet || layupDraft.length < 2) return;
-      const last = layupDraft[layupDraft.length - 1];
+      if (!activeSheet || layupDraft.length !== 3) return;
+      if (pathLengthFt(layupDraft) < MIN_LAYUP_PATH_FT) return;
+      const last = layupDraft[2];
       addShot({
         session_name: activeSheet,
         result: "missed",
@@ -1136,10 +1194,12 @@
         court_x: last[0],
         court_y: last[1],
       });
-      layupDraft = [];
+      layupDraft = [LAYUP_START_FT.slice()];
+      layupDragPreview = null;
+      layupDragging = false;
       refreshAll();
     });
-    bindLayupCanvas();
+    bindLayupThreePoint();
 
     document.getElementById("btn-sheet-prev").addEventListener("click", () => {
       sheetGridPage = Math.max(0, sheetGridPage - 1);

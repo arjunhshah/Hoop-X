@@ -4,13 +4,13 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="theme-color" content="#000000" />
-    <title>Swish — Basketball tracker</title>
+    <title>Hoop-X — Basketball tracker</title>
     <link rel="stylesheet" href="css/swish.css" />
   </head>
   <body>
     <div class="app">
       <aside class="sidebar">
-        <p class="brand">Swish</p>
+        <p class="brand">Hoop-X</p>
         <p class="tagline">Basketball tracker</p>
         <h2>Sheets</h2>
         <form class="sheet-form" id="add-sheet-form" action="#" novalidate>
@@ -25,8 +25,8 @@
         </form>
         <ul class="sheet-list" id="sheet-list"></ul>
         <p class="caption" style="margin-top: 1.5rem">
-          Data stays in this browser (localStorage). Use Streamlit
-          <code>swish.py</code> for the full app.
+          Data stays in this browser (localStorage). Use the Streamlit app
+          (<code>swish.py</code>) for the full experience.
         </p>
       </aside>
       <main>
@@ -176,7 +176,8 @@
 
           <div id="layup-panel" class="hidden">
             <p class="caption">
-              Drag to sketch your route (dots show start and end). Then
+              <strong>3-dot layup:</strong> drag from the gold start dot to place the
+              2nd dot, then <strong>tap</strong> for the 3rd (finish). Then
               <strong>Made</strong> or <strong>Missed</strong>.
             </p>
             <div class="court-wrap">
@@ -184,7 +185,7 @@
             </div>
             <div class="actions">
               <button type="button" class="btn" id="btn-clear-layup">
-                Clear drawing
+                Reset layup
               </button>
               <button type="button" class="btn made" id="btn-lay-made" disabled>
                 Made

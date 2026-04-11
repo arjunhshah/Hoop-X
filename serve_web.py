@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Serve the Swish browser UI (static HTML/CSS/JS).
+"""Serve the Hoop-X browser UI (static HTML/CSS/JS).
 
   python3 serve_web.py
 
@@ -28,7 +28,7 @@ def main() -> None:
             return
 
     with socketserver.TCPServer(("", PORT), Handler) as httpd:
-        print(f"Swish web → http://127.0.0.1:{PORT}/")
+        print(f"Hoop-X web → http://127.0.0.1:{PORT}/")
         print("Press Ctrl+C to stop.")
         try:
             httpd.serve_forever()

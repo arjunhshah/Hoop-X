@@ -1,7 +1,7 @@
-# Streamlit app (swish.py) — Streamlit Community Cloud & local dev
+# Hoop-X Streamlit app (swish.py) — Streamlit Community Cloud & local dev
+# Layup is 3-dot taps (no streamlit-drawable-canvas). Do not add it — breaks on Streamlit 1.41+ (image_to_url).
 streamlit>=1.37.0
 numpy>=1.26.0
 Pillow>=10.2.0
-streamlit-drawable-canvas>=0.9.3
 streamlit-image-coordinates>=0.1.6
 matplotlib>=3.8.0
