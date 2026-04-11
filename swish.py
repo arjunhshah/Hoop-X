@@ -5,6 +5,7 @@ import datetime
 import hashlib
 import io
 import json
+import os
 import re
 from functools import lru_cache
 from pathlib import Path
@@ -86,7 +87,7 @@ MIN_LAYUP_PATH_FT = 0.65
 LAYUP_THREE_START_FT = (0.0, 6.5)
 
 # Canvas / background size (50:47 court aspect; image is scaled to this)
-COURT_IMG_W = 512
+COURT_IMG_W = 768
 COURT_IMG_H = int(round(COURT_IMG_W * (COURT_Y1 - COURT_Y0) / (COURT_X1 - COURT_X0)))
 # Inset mapping so baselines / 3pt lines aren’t clipped by thick strokes at bitmap edges
 COURT_VIEW_MARGIN_PX = 8
@@ -675,6 +676,8 @@ def init_state():
     st.session_state.setdefault("_last_shot_mode", None)
     st.session_state.setdefault("court_inspect_id", None)
     st.session_state.setdefault("session_subview", "court")
+    st.session_state.setdefault("coach_chat_by_sheet", {})
+    st.session_state.setdefault("home_sheets_expanded", False)
     if "base44" not in st.session_state:
         st.session_state.base44 = Base44()
 
@@ -695,6 +698,41 @@ def shots_today(all_shots: list) -> list:
 def sheet_button_key(sheet: str, idx: int) -> str:
     safe = re.sub(r"[^\w\-]", "_", sheet)[:40]
     return f"open_sheet_{idx}_{safe}"
+
+
+def _render_home_sheet_cell(sheet: str, idx: int, shots_today_list: list) -> None:
+    """Compact dashboard tile: name, stats, shot list expander, Open button."""
+    sub_shots = [s for s in shots_today_list if s.get("session_name") == sheet]
+    m = sum(1 for s in sub_shots if s["result"] == "made")
+    x = sum(1 for s in sub_shots if s["result"] == "missed")
+    tot = m + x
+    acc = round(100 * m / tot, 0) if tot else None
+    if tot:
+        stat_line = f"{tot} shots today · {int(acc)}% made"
+    else:
+        stat_line = "No shots yet today"
+
+    st.markdown(f"**{sheet}**")
+    st.caption(stat_line)
+    exp_label = f"Today’s shots ({tot})" if tot else "Today’s shots (0)"
+    with st.expander(exp_label, expanded=False):
+        if not sub_shots:
+            st.caption("No shots on this sheet today yet.")
+        else:
+            for s in sorted(
+                sub_shots,
+                key=lambda x: x["created_date"],
+                reverse=True,
+            ):
+                st.write(format_shot_one_line(s))
+    if st.button(
+        "Open sheet",
+        key=sheet_button_key(sheet, idx),
+        use_container_width=True,
+    ):
+        st.session_state.active_session = sheet
+        st.session_state.session_subview = "court"
+        st.rerun()
 
 
 def split_shots_for_map(today_shots: list):
@@ -999,6 +1037,308 @@ def build_coach_feedback(
     return "\n".join(lines)
 
 
+_COACH_SYSTEM = """You are a supportive basketball skills coach for someone using the Hoop-X training app.
+Use ONLY the statistics in the context block; do not invent games, teammates, or numbers not given.
+Answer in a friendly, concise way (short paragraphs unless the player asks for detail).
+You may discuss form, drills, mindset, and how to read their numbers.
+If asked something unrelated to basketball or training, answer briefly then steer back helpfully."""
+
+
+def _get_openai_api_key() -> str | None:
+    try:
+        k = st.secrets.get("OPENAI_API_KEY")
+        if k:
+            return str(k).strip()
+    except Exception:
+        pass
+    env = os.environ.get("OPENAI_API_KEY", "").strip()
+    return env or None
+
+
+def _get_openai_model() -> str:
+    try:
+        m = st.secrets.get("OPENAI_MODEL")
+        if m:
+            return str(m).strip()
+    except Exception:
+        pass
+    return os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
+
+
+def _coach_stats_context_for_llm(
+    skills: dict,
+    sheet_name: str,
+    overall_total: int,
+    overall_pct: float,
+    made: int,
+    missed: int,
+) -> str:
+    jp = skills["jump_pct"]
+    lp = skills["layup_pct"]
+    fg = skills["fg_pct"]
+    lines = [
+        f"Sheet: {sheet_name}",
+        f"Today on this sheet — attempts: {skills['total']}, made: {made}, missed: {missed}",
+        f"Overall FG% (this sheet): {fg if fg is not None else 'n/a'}",
+        f"Jump shots: {skills['jump_made']}/{skills['jump_total']}"
+        + (f" ({jp}%)" if jp is not None else ""),
+        f"Layups: {skills['layup_made']}/{skills['layup_total']}"
+        + (f" ({lp}%)" if lp is not None else ""),
+        f"Today all sheets combined — total shots: {overall_total}, overall FG%: {overall_pct if overall_total else 'n/a'}",
+    ]
+    return "\n".join(lines)
+
+
+def _initial_coach_messages(skills: dict, sheet_name: str, overall_total: int) -> list[dict]:
+    opening = (
+        build_coach_feedback(skills, sheet_name, overall_total)
+        + "\n\n---\n**Ask me anything** — your numbers, form, drills, or what to focus on next."
+    )
+    return [{"role": "assistant", "content": opening}]
+
+
+def _coach_openai_reply(
+    history: list[dict],
+    stats_context: str,
+) -> str:
+    from openai import OpenAI
+
+    key = _get_openai_api_key()
+    if not key:
+        raise RuntimeError("missing OPENAI_API_KEY")
+
+    system_text = _COACH_SYSTEM + "\n\n--- CONTEXT ---\n" + stats_context
+    api_messages: list[dict] = [{"role": "system", "content": system_text}]
+    h = list(history)[-24:]
+    if h and h[0]["role"] == "assistant":
+        api_messages.append(
+            {
+                "role": "user",
+                "content": "I'm on my skills page — what stands out from my stats?",
+            }
+        )
+    for m in h:
+        api_messages.append({"role": m["role"], "content": m["content"]})
+
+    base_url = (
+        os.environ.get("OPENAI_BASE_URL")
+        or os.environ.get("OPENAI_API_BASE")
+        or None
+    )
+    try:
+        bu = st.secrets.get("OPENAI_BASE_URL")
+        if bu:
+            base_url = str(bu).strip() or base_url
+    except Exception:
+        pass
+
+    kwargs: dict = {"api_key": key}
+    if base_url:
+        kwargs["base_url"] = base_url
+    client = OpenAI(**kwargs)
+    resp = client.chat.completions.create(
+        model=_get_openai_model(),
+        messages=api_messages,
+        max_tokens=700,
+        temperature=0.65,
+    )
+    choice = resp.choices[0].message.content
+    return (choice or "").strip() or "(No reply text.)"
+
+
+def _coach_reply_rule_based(
+    question: str,
+    skills: dict,
+    sheet_name: str,
+    overall_pct: float,
+    overall_total: int,
+    *,
+    suggest_api_key: bool = True,
+) -> str:
+    q = question.lower().strip()
+    tt = skills["total"]
+    fg = skills["fg_pct"]
+    jp, lp = skills["jump_pct"], skills["layup_pct"]
+    jt, lt = skills["jump_total"], skills["layup_total"]
+
+    def fg_line() -> str:
+        if fg is None or tt == 0:
+            return f"On **{sheet_name}** you don’t have enough shots today for an FG% yet — log a few on the court and come back."
+        return f"Your overall FG on this sheet today is **{fg:.1f}%** ({tt} attempts)."
+
+    if any(x in q for x in ("hello", "hi ", "hey", "sup")):
+        return f"{fg_line()} What do you want to dig into — jumpers, layups, or overall rhythm?"
+
+    if "jump" in q or "jumper" in q or "three" in q or "shot" in q:
+        if jt == 0:
+            return "You haven’t logged jump shots on this sheet today. When you do, we can compare them to your layups."
+        if jp is None:
+            return "Jump shot sample is still thin — keep logging."
+        return (
+            f"Jump shots here: **{skills['jump_made']}/{jt}** ({jp:.0f}%). "
+            + (
+                "That’s solid — keep the same lift and hold your follow-through."
+                if jp >= 45
+                else "Consider a step in or extra form reps before stretching range."
+            )
+        )
+
+    if "layup" in q or "rim" in q or "finish" in q:
+        if lt == 0:
+            return "No layups logged on this sheet today — add some finishes to balance the picture."
+        if lp is None:
+            return "Layup sample is still thin — keep logging."
+        return (
+            f"Layups here: **{skills['layup_made']}/{lt}** ({lp:.0f}%). "
+            + (
+                "Nice finishing — protect the ball on the last step."
+                if lp >= 45
+                else "Work on angles and soft touch off the glass in warmups."
+            )
+        )
+
+    if any(
+        x in q
+        for x in (
+            "work on",
+            "improve",
+            "focus",
+            "practice",
+            "drill",
+            "better",
+            "weak",
+        )
+    ):
+        parts = [fg_line()]
+        if tt >= 4 and jp is not None and lp is not None and jt >= 2 and lt >= 2:
+            if jp < lp - 10:
+                parts.append("Jump FG is trailing layups — add spot mid-range or free throws before deep shots.")
+            elif lp < jp - 10:
+                parts.append("Layups are behind jumpers — add Mikan or reverse finishes.")
+            else:
+                parts.append("Jump and layup rates are in the same ballpark — push volume with game-speed cuts.")
+        else:
+            parts.append("Log a mix of jumpers and layups so we can see where to lean.")
+        return " ".join(parts)
+
+    if "overall" in q or "percent" in q or "%" in q or "fg" in q:
+        oline = (
+            f"**All sheets today:** {overall_total} shots, **{overall_pct:.1f}%** FG."
+            if overall_total
+            else "No shots logged today across sheets yet."
+        )
+        return f"{fg_line()} {oline}"
+
+    if "thank" in q:
+        return "You got it — keep logging shots and ask anytime."
+
+    tail = (
+        "I can talk about **jump vs layup** splits, **what to work on**, or **today’s overall FG**."
+    )
+    if suggest_api_key:
+        tail += (
+            " For richer conversational answers, add an **OPENAI_API_KEY** in Streamlit secrets "
+            "(or your environment)."
+        )
+    return f"{fg_line()} {tail}"
+
+
+def _coach_reply(
+    history: list[dict],
+    stats_context: str,
+    skills: dict,
+    sheet_name: str,
+    overall_total: int,
+    overall_pct: float,
+) -> str:
+    last = history[-1]["content"] if history else ""
+    key = _get_openai_api_key()
+    if key:
+        try:
+            return _coach_openai_reply(history, stats_context)
+        except Exception as e:
+            err = _coach_reply_rule_based(
+                last,
+                skills,
+                sheet_name,
+                overall_pct,
+                overall_total,
+                suggest_api_key=False,
+            )
+            return f"{err}\n\n*(Quick mode: {type(e).__name__}.)*"
+    return _coach_reply_rule_based(
+        last, skills, sheet_name, overall_pct, overall_total, suggest_api_key=True
+    )
+
+
+def _coach_widget_suffix(sheet: str) -> str:
+    safe = re.sub(r"[^\w\-]", "_", sheet)[:48]
+    return f"{safe}_{hashlib.md5(sheet.encode()).hexdigest()[:8]}"
+
+
+def _render_coach_chat(
+    active_sheet: str,
+    skills: dict,
+    today_shots: list,
+    overall_total: int,
+    overall_pct: float,
+    made: int,
+    missed: int,
+) -> None:
+    wk = _coach_widget_suffix(active_sheet)
+    chats: dict = st.session_state.coach_chat_by_sheet
+    if active_sheet not in chats or not chats[active_sheet]:
+        chats[active_sheet] = _initial_coach_messages(
+            skills, active_sheet, overall_total
+        )
+
+    history: list[dict] = chats[active_sheet]
+    stats_ctx = _coach_stats_context_for_llm(
+        skills, active_sheet, overall_total, overall_pct, made, missed
+    )
+
+    st.write("##### AI coach")
+    if _get_openai_api_key():
+        st.caption("Chat with your coach — questions about stats, form, or what to practice next.")
+    else:
+        st.caption(
+            "**Quick mode** — I answer from your numbers here. "
+            "Set `OPENAI_API_KEY` in [Streamlit secrets](https://docs.streamlit.io/deploy/streamlit-community-cloud/manage-your-app#secrets) "
+            "for full conversational coaching."
+        )
+
+    h1, h2 = st.columns([4, 1])
+    with h2:
+        if st.button("Clear chat", key=f"coach_clear_{wk}"):
+            chats[active_sheet] = _initial_coach_messages(
+                compute_sheet_skills(today_shots),
+                active_sheet,
+                overall_total,
+            )
+            st.rerun()
+
+    for m in history:
+        with st.chat_message(m["role"]):
+            st.markdown(m["content"])
+
+    if prompt := st.chat_input(
+        "Ask the coach…",
+        key=f"coach_in_{wk}",
+    ):
+        history.append({"role": "user", "content": prompt})
+        reply = _coach_reply(
+            history,
+            stats_ctx,
+            skills,
+            active_sheet,
+            overall_total,
+            overall_pct,
+        )
+        history.append({"role": "assistant", "content": reply})
+        chats[active_sheet] = history
+        st.rerun()
+
+
 def _render_skills_page(active_sheet: str) -> None:
     base44 = get_base44()
     all_shots = base44.list_shots()
@@ -1036,6 +1376,16 @@ def _render_skills_page(active_sheet: str) -> None:
     o3.metric("Missed (all)", overall_miss)
     o4.metric("FG% (all)", f"{overall_pct}%" if overall_total else "—")
 
+    _render_coach_chat(
+        active_sheet,
+        skills,
+        today_shots,
+        overall_total,
+        overall_pct,
+        made,
+        missed,
+    )
+
     ch_left, ch_right = st.columns(2)
     with ch_left:
         st.caption("Jump vs. layup vs. overall FG — this sheet")
@@ -1056,9 +1406,6 @@ def _render_skills_page(active_sheet: str) -> None:
         st.image(io.BytesIO(run_buf), use_container_width=True)
     else:
         st.caption("Log at least two shots on this sheet today to see a running FG% curve.")
-
-    st.write("##### AI coach")
-    st.markdown(build_coach_feedback(skills, active_sheet, overall_total))
 
 
 def _render_active_session(active_sheet: str) -> None:
@@ -1333,7 +1680,7 @@ def tracker_app():
 
     with st.sidebar:
         st.markdown("### Sheets")
-        st.caption("Add or remove sheets. Tap a sheet on the home screen to practice.")
+        st.caption("Add or remove sheets. Use **Open sheet** on the dashboard to practice.")
         new_sheet = st.text_input("New sheet name", placeholder="e.g. Free throws", key="new_sheet")
         if st.button("Add sheet", type="secondary") and new_sheet.strip():
             s = new_sheet.strip()
@@ -1417,57 +1764,55 @@ def tracker_app():
     c4.metric("Accuracy", f"{pct}%")
 
     st.subheader("Sheets")
-    st.caption("Tap a sheet to open your session.")
+    st.caption(
+        "One row shows up to four sheets. **Open sheet** starts a session; "
+        "use **⋯** below if you have more than four."
+    )
     sheet_names = list(st.session_state.sheets)
     if not sheet_names:
         st.caption("No sheets — add one in the sidebar.")
     else:
-        per_row = 3
-        for row_start in range(0, len(sheet_names), per_row):
-            chunk = sheet_names[row_start : row_start + per_row]
-            cols = st.columns(len(chunk))
-            for j, sheet in enumerate(chunk):
-                idx = row_start + j
-                sub = [s for s in shots_today_list if s.get("session_name") == sheet]
-                m = sum(1 for s in sub if s["result"] == "made")
-                x = sum(1 for s in sub if s["result"] == "missed")
-                tot = m + x
-                acc = round(100 * m / tot, 0) if tot else None
-                if tot:
-                    subtitle = f"{tot} shots today · {int(acc)}% made"
-                else:
-                    subtitle = "Tap to start"
-                label = f"{sheet}\n{subtitle}"
-                with cols[j]:
-                    with st.container(border=True):
-                        sub_shots = [
-                            s
-                            for s in shots_today_list
-                            if s.get("session_name") == sheet
-                        ]
-                        exp_label = (
-                            f"Which shots ({tot})"
-                            if tot
-                            else "Which shots (0)"
-                        )
-                        with st.expander(exp_label, expanded=False):
-                            if not sub_shots:
-                                st.caption("No shots on this sheet today yet.")
-                            else:
-                                for s in sorted(
-                                    sub_shots,
-                                    key=lambda x: x["created_date"],
-                                    reverse=True,
-                                ):
-                                    st.write(format_shot_one_line(s))
-                        if st.button(
-                            label,
-                            key=sheet_button_key(sheet, idx),
-                            use_container_width=True,
-                        ):
-                            st.session_state.active_session = sheet
-                            st.session_state.session_subview = "court"
-                            st.rerun()
+        row_a = sheet_names[:4]
+        cols = st.columns(4)
+        for i in range(4):
+            with cols[i]:
+                if i < len(row_a):
+                    _render_home_sheet_cell(row_a[i], i, shots_today_list)
+
+        if len(sheet_names) > 4:
+            n_extra = len(sheet_names) - 4
+            expanded = st.session_state.get("home_sheets_expanded", False)
+            if not expanded:
+                _e1, _e2, _e3 = st.columns([1, 2, 1])
+                with _e2:
+                    label = f"⋯  {n_extra} more sheet{'s' if n_extra != 1 else ''}"
+                    if st.button(
+                        label,
+                        key="home_expand_sheets",
+                        use_container_width=True,
+                        help="Show additional sheets",
+                    ):
+                        st.session_state.home_sheets_expanded = True
+                        st.rerun()
+            else:
+                st.divider()
+                rest = sheet_names[4:]
+                for row_start in range(0, len(rest), 4):
+                    chunk = rest[row_start : row_start + 4]
+                    rcols = st.columns(4)
+                    for j, sheet in enumerate(chunk):
+                        gidx = 4 + row_start + j
+                        with rcols[j]:
+                            _render_home_sheet_cell(sheet, gidx, shots_today_list)
+                _c1, _c2, _c3 = st.columns([1, 2, 1])
+                with _c2:
+                    if st.button(
+                        "Show less",
+                        key="home_collapse_sheets",
+                        use_container_width=True,
+                    ):
+                        st.session_state.home_sheets_expanded = False
+                        st.rerun()
 
     st.subheader("Recent (all sheets)")
     recent = shots_today_list[:12]

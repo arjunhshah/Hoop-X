@@ -18,7 +18,7 @@
   const FT_CIRCLE_R = 6;
   const PAINT_X = 8;
   const FT_Y = 19;
-  const COURT_W = 512;
+  const COURT_W = 768;
   const COURT_H = Math.round((COURT_W * (COURT_Y1 - COURT_Y0)) / (COURT_X1 - COURT_X0));
   const COURT_MARGIN = 8;
   /** Default first dot for 3-dot layup (matches Streamlit LAYUP_THREE_START_FT). */
