@@ -746,12 +746,26 @@ def composite_full_court_coach(
     h: int,
     markers: list[dict],
     pending_court_xy: tuple[float, float] | None = None,
+    *,
+    side: str = "offence",
 ) -> Image.Image:
-    """Draw numbered player markers; same (x,y) stacks with vertical pixel offset."""
+    """Draw numbered player markers; offence = blue, defence = red; court tinted to match."""
     from collections import defaultdict
 
-    img = base.copy()
+    sl = side.lower()
+    is_defence = sl in ("defence", "defense")
+
+    img = base.copy().convert("RGBA")
+    if is_defence:
+        tint = Image.new("RGBA", (w, h), (200, 45, 45, 42))
+    else:
+        tint = Image.new("RGBA", (w, h), (35, 95, 210, 40))
+    img = Image.alpha_composite(img, tint)
     dr = ImageDraw.Draw(img, "RGBA")
+
+    mk_fill = (215, 60, 60, 245) if is_defence else (45, 120, 225, 245)
+    mk_outline = (255, 210, 210, 255) if is_defence else (200, 225, 255, 255)
+    pend_line = (255, 110, 110, 255) if is_defence else (120, 175, 255, 255)
 
     groups: dict[tuple[float, float], list[tuple[int, dict]]] = defaultdict(list)
     for i, m in enumerate(markers):
@@ -773,8 +787,8 @@ def composite_full_court_coach(
             r = 17
             dr.ellipse(
                 (cx - r, cy - r, cx + r, cy + r),
-                fill=(55, 130, 210, 235),
-                outline=(255, 255, 255, 255),
+                fill=mk_fill,
+                outline=mk_outline,
                 width=2,
             )
             if hasattr(dr, "textbbox"):
@@ -797,11 +811,11 @@ def composite_full_court_coach(
         r = 22
         dr.ellipse(
             (px - r, py - r, px + r, py + r),
-            outline=(251, 191, 36, 255),
+            outline=pend_line,
             width=4,
         )
-        dr.line([(px - 8, py), (px + 8, py)], fill=(251, 191, 36, 255), width=2)
-        dr.line([(px, py - 8), (px, py + 8)], fill=(251, 191, 36, 255), width=2)
+        dr.line([(px - 8, py), (px + 8, py)], fill=pend_line, width=2)
+        dr.line([(px, py - 8), (px, py + 8)], fill=pend_line, width=2)
 
     return img.convert("RGB")
 
@@ -955,7 +969,8 @@ def _render_coach_dashboard() -> None:
     with hdr_l:
         side_now = st.session_state.get("coach_side", "offence")
         st.markdown(
-            f"**Mode:** **{side_now.capitalize()}** — markers are separate for offence vs defence."
+            f"**Mode:** **{side_now.capitalize()}** — **offence** uses a blue court & markers; "
+            "**defence** uses red. Each mode keeps its own markers."
         )
     with hdr_r:
         tgt = "Defence" if side_now == "offence" else "Offence"
@@ -1018,23 +1033,21 @@ def _render_coach_dashboard() -> None:
         pending_court_xy=(float(pending["x"]), float(pending["y"]))
         if isinstance(pending, dict) and "x" in pending
         else None,
+        side=side,
     )
 
     st.caption(
-        "Tap the full court to pick a spot. Enter the jersey # under the court, then **Place marker**."
+        "Tap the full court to pick a spot. The jersey # field appears **beside** the court (not below)."
     )
 
     dedup_k = f"_coach_fc_dedup_{pick}_{side}"
-    picked = streamlit_image_coordinates(
-        court_rgb,
-        width=FULL_COURT_IMG_W,
-        height=FULL_COURT_IMG_H,
-        key=f"coach_fc_img_{pick}_{side}",
-        use_column_width="always",
-    )
-    if picked is not None and not pending:
+    img_key = f"coach_fc_img_{pick}_{side}"
+
+    def _coach_process_court_click(picked_click: dict | None) -> None:
+        if picked_click is None or st.session_state.get("coach_pending"):
+            return
         nx, ny = native_px_from_image_click(
-            picked, FULL_COURT_IMG_W, FULL_COURT_IMG_H
+            picked_click, FULL_COURT_IMG_W, FULL_COURT_IMG_H
         )
         cx, cy = pixel_to_full_court(nx, ny, FULL_COURT_IMG_W, FULL_COURT_IMG_H)
         txy = (int(round(nx)), int(round(ny)))
@@ -1044,35 +1057,59 @@ def _render_coach_dashboard() -> None:
             st.rerun()
 
     if pending:
-        st.text_input(
-            "Jersey # (saved on the marker)",
-            key="coach_jersey_txt",
-            max_chars=6,
-            placeholder="e.g. 23",
-        )
-        p1, p2 = st.columns(2)
-        place_key = f"coach_place_{mk}"
-        cancel_key = f"coach_cancel_{mk}"
-        if p1.button("Place marker", type="primary", key=place_key):
-            num = str(st.session_state.get("coach_jersey_txt", "")).strip() or "?"
-            nid = int(st.session_state.get("coach_marker_seq", 1))
-            st.session_state.coach_marker_seq = nid + 1
-            markers.append(
-                {
-                    "id": nid,
-                    "x": float(pending["x"]),
-                    "y": float(pending["y"]),
-                    "number": num,
-                }
+        form_col, court_col = st.columns([1, 2.35])
+        with form_col:
+            with st.container(border=True):
+                st.markdown("##### New marker")
+                st.caption(
+                    f"**Spot (ft):** ({float(pending['x']):.1f}, {float(pending['y']):.1f})"
+                )
+                st.text_input(
+                    "Jersey #",
+                    key="coach_jersey_txt",
+                    max_chars=6,
+                    placeholder="e.g. 23",
+                )
+                place_key = f"coach_place_{mk}"
+                cancel_key = f"coach_cancel_{mk}"
+                if st.button("Place marker", type="primary", key=place_key, use_container_width=True):
+                    num = str(st.session_state.get("coach_jersey_txt", "")).strip() or "?"
+                    nid = int(st.session_state.get("coach_marker_seq", 1))
+                    st.session_state.coach_marker_seq = nid + 1
+                    markers.append(
+                        {
+                            "id": nid,
+                            "x": float(pending["x"]),
+                            "y": float(pending["y"]),
+                            "number": num,
+                        }
+                    )
+                    st.session_state.coach_markers[mk] = markers
+                    st.session_state.coach_pending = None
+                    st.session_state.pop("coach_jersey_txt", None)
+                    st.rerun()
+                if st.button("Cancel", key=cancel_key, use_container_width=True):
+                    st.session_state.coach_pending = None
+                    st.session_state.pop("coach_jersey_txt", None)
+                    st.rerun()
+        with court_col:
+            picked = streamlit_image_coordinates(
+                court_rgb,
+                width=FULL_COURT_IMG_W,
+                height=FULL_COURT_IMG_H,
+                key=img_key,
+                use_column_width="always",
             )
-            st.session_state.coach_markers[mk] = markers
-            st.session_state.coach_pending = None
-            st.session_state.pop("coach_jersey_txt", None)
-            st.rerun()
-        if p2.button("Cancel", key=cancel_key):
-            st.session_state.coach_pending = None
-            st.session_state.pop("coach_jersey_txt", None)
-            st.rerun()
+            _coach_process_court_click(picked)
+    else:
+        picked = streamlit_image_coordinates(
+            court_rgb,
+            width=FULL_COURT_IMG_W,
+            height=FULL_COURT_IMG_H,
+            key=img_key,
+            use_column_width="always",
+        )
+        _coach_process_court_click(picked)
 
     u1, u2 = st.columns(2)
     if u1.button("Undo last marker", key="coach_undo_mk", disabled=len(markers) == 0):
