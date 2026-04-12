@@ -787,21 +787,15 @@ def composite_full_court_coach(
     pending_court_xy: tuple[float, float] | None = None,
     *,
     side: str = "offence",
-    pending_ring_color: str | None = None,
 ) -> Image.Image:
-    """Split blue/red half-court tints (swap on offence/defence); markers default blue if unset."""
+    """Split blue/red half-court tints; markers and pending ring always blue (readable on both halves)."""
     from collections import defaultdict
-
-    default_mc = "blue"
 
     img = base.copy().convert("RGBA")
     img = _apply_split_fullcourt_tint(img, w, h, side)
     dr = ImageDraw.Draw(img, "RGBA")
 
-    pr = (pending_ring_color or "blue").lower()
-    if pr not in ("blue", "red"):
-        pr = "blue"
-    pend_line = _coach_pending_line_rgba(pr)
+    pend_line = _coach_pending_line_rgba("blue")
 
     groups: dict[tuple[float, float], list[tuple[int, dict]]] = defaultdict(list)
     for i, m in enumerate(markers):
@@ -821,10 +815,7 @@ def composite_full_court_coach(
             cx = px0
             num = str(m.get("number", "?")).strip() or "?"
             r = 17
-            mc = str(m.get("color", default_mc)).lower()
-            if mc not in ("blue", "red"):
-                mc = "blue"
-            mk_fill, mk_outline = _coach_marker_palette(mc)
+            mk_fill, mk_outline = _coach_marker_palette("blue")
             dr.ellipse(
                 (cx - r, cy - r, cx + r, cy + r),
                 fill=mk_fill,
@@ -1066,7 +1057,7 @@ def _render_coach_dashboard() -> None:
         side_now = st.session_state.get("coach_side", "offence")
         st.markdown(
             f"**Mode:** **{side_now.capitalize()}** — one half of the floor is **blue**, one **red** "
-            "(they **swap** when you switch offence/defence). Default marker color is **blue**; you can pick red in the panel."
+            "(they **swap** when you switch offence/defence). Markers are always **blue** on both halves."
         )
     with hdr_r:
         tgt = "Defence" if side_now == "offence" else "Offence"
@@ -1077,7 +1068,6 @@ def _render_coach_dashboard() -> None:
         ):
             st.session_state.coach_side = "defence" if side_now == "offence" else "offence"
             st.session_state.coach_pending = None
-            st.session_state.pop("coach_pcolor_radio", None)
             st.rerun()
 
     add_l, add_r = st.columns([4, 1])
@@ -1096,7 +1086,6 @@ def _render_coach_dashboard() -> None:
                     st.session_state.coach_sheets.append(name)
                 st.session_state.coach_active_sheet = name
                 st.session_state.coach_pending = None
-                st.session_state.pop("coach_pcolor_radio", None)
                 st.rerun()
 
     sheets = list(st.session_state.coach_sheets)
@@ -1111,7 +1100,6 @@ def _render_coach_dashboard() -> None:
     pick = st.selectbox("Play sheet", options=sheets, key="coach_sheet_select")
     if prev_sheet != pick:
         st.session_state.coach_pending = None
-        st.session_state.pop("coach_pcolor_radio", None)
     st.session_state._coach_ui_prev_sheet = pick
     st.session_state.coach_active_sheet = pick
 
@@ -1123,16 +1111,6 @@ def _render_coach_dashboard() -> None:
 
     pending = st.session_state.get("coach_pending")
 
-    if isinstance(pending, dict) and pending.get("x") is not None:
-        if "coach_pcolor_radio" not in st.session_state:
-            st.session_state["coach_pcolor_radio"] = "Blue"
-
-    pending_ring_color: str | None = None
-    if isinstance(pending, dict) and pending.get("x") is not None:
-        pending_ring_color = (
-            "red" if st.session_state.get("coach_pcolor_radio") == "Red" else "blue"
-        )
-
     base = get_nba_fullcourt_rgb(FULL_COURT_IMG_W, FULL_COURT_IMG_H)
     court_rgb = composite_full_court_coach(
         base,
@@ -1143,12 +1121,11 @@ def _render_coach_dashboard() -> None:
         if isinstance(pending, dict) and "x" in pending
         else None,
         side=side,
-        pending_ring_color=pending_ring_color,
     )
 
     st.caption(
-        "Tap the court. Floor is **half blue / half red** (which side is which swaps with **Offence↔Defence**). "
-        "Default marker is **Blue** — use the radio for red. Then jersey # and **Place marker**."
+        "Tap the court. Floor is **half blue / half red** (swaps with **Offence↔Defence**). "
+        "Markers are always **blue** on both halves. Enter jersey #, then **Place marker**."
     )
 
     dedup_k = f"_coach_fc_dedup_{pick}_{side}"
@@ -1164,7 +1141,6 @@ def _render_coach_dashboard() -> None:
         txy = (int(round(nx)), int(round(ny)))
         if st.session_state.get(dedup_k) != txy:
             st.session_state[dedup_k] = txy
-            st.session_state.pop("coach_pcolor_radio", None)
             st.session_state.coach_pending = {"x": cx, "y": cy}
             st.rerun()
 
@@ -1176,12 +1152,6 @@ def _render_coach_dashboard() -> None:
                 st.caption(
                     f"**Spot (ft):** ({float(pending['x']):.1f}, {float(pending['y']):.1f})"
                 )
-                st.radio(
-                    "Marker color",
-                    ["Blue", "Red"],
-                    horizontal=True,
-                    key="coach_pcolor_radio",
-                )
                 st.text_input(
                     "Jersey #",
                     key="coach_jersey_txt",
@@ -1192,11 +1162,6 @@ def _render_coach_dashboard() -> None:
                 cancel_key = f"coach_cancel_{mk}"
                 if st.button("Place marker", type="primary", key=place_key, use_container_width=True):
                     num = str(st.session_state.get("coach_jersey_txt", "")).strip() or "?"
-                    mcol = (
-                        "red"
-                        if st.session_state.get("coach_pcolor_radio") == "Red"
-                        else "blue"
-                    )
                     nid = int(st.session_state.get("coach_marker_seq", 1))
                     st.session_state.coach_marker_seq = nid + 1
                     markers.append(
@@ -1205,18 +1170,16 @@ def _render_coach_dashboard() -> None:
                             "x": float(pending["x"]),
                             "y": float(pending["y"]),
                             "number": num,
-                            "color": mcol,
+                            "color": "blue",
                         }
                     )
                     st.session_state.coach_markers[mk] = markers
                     st.session_state.coach_pending = None
                     st.session_state.pop("coach_jersey_txt", None)
-                    st.session_state.pop("coach_pcolor_radio", None)
                     st.rerun()
                 if st.button("Cancel", key=cancel_key, use_container_width=True):
                     st.session_state.coach_pending = None
                     st.session_state.pop("coach_jersey_txt", None)
-                    st.session_state.pop("coach_pcolor_radio", None)
                     st.rerun()
         with court_col:
             picked = streamlit_image_coordinates(
@@ -1245,7 +1208,6 @@ def _render_coach_dashboard() -> None:
     if u2.button("Clear markers (this sheet · this mode)", key="coach_clear_mk"):
         st.session_state.coach_markers[mk] = []
         st.session_state.coach_pending = None
-        st.session_state.pop("coach_pcolor_radio", None)
         st.rerun()
 
 
