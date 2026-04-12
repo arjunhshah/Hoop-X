@@ -753,6 +753,32 @@ def _coach_pending_line_rgba(which: str) -> tuple[int, ...]:
     return (120, 175, 255, 255)
 
 
+def _apply_split_fullcourt_tint(
+    img_rgba: Image.Image, w: int, h: int, side: str
+) -> Image.Image:
+    """Half the court blue, half red at midcourt (y=47 ft). Offence vs defence swaps which half is which."""
+    _, py_mid = feet_to_pixel_full(0.0, 47.0, w, h)
+    py_mid = int(round(py_mid))
+    m = COURT_VIEW_MARGIN_PX
+    py_mid = max(m + 1, min(h - m - 1, py_mid))
+
+    blue = (35, 95, 210, 44)
+    red = (200, 45, 45, 44)
+    ov = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    dr = ImageDraw.Draw(ov)
+    is_def = str(side).lower() in ("defence", "defense")
+    # Bottom of image (large py) = court y toward 0; top = court y toward 94.
+    if not is_def:
+        # Offence: bottom half blue, top half red
+        dr.rectangle([0, py_mid, w, h], fill=blue)
+        dr.rectangle([0, 0, w, py_mid], fill=red)
+    else:
+        # Defence: bottom half red, top half blue
+        dr.rectangle([0, py_mid, w, h], fill=red)
+        dr.rectangle([0, 0, w, py_mid], fill=blue)
+    return Image.alpha_composite(img_rgba, ov)
+
+
 def composite_full_court_coach(
     base: Image.Image,
     w: int,
@@ -763,24 +789,18 @@ def composite_full_court_coach(
     side: str = "offence",
     pending_ring_color: str | None = None,
 ) -> Image.Image:
-    """Court tint follows offence/defence mode; each marker uses stored blue/red (or mode default)."""
+    """Split blue/red half-court tints (swap on offence/defence); markers default blue if unset."""
     from collections import defaultdict
 
-    sl = side.lower()
-    is_defence = sl in ("defence", "defense")
-    default_mc = "red" if is_defence else "blue"
+    default_mc = "blue"
 
     img = base.copy().convert("RGBA")
-    if is_defence:
-        tint = Image.new("RGBA", (w, h), (200, 45, 45, 42))
-    else:
-        tint = Image.new("RGBA", (w, h), (35, 95, 210, 40))
-    img = Image.alpha_composite(img, tint)
+    img = _apply_split_fullcourt_tint(img, w, h, side)
     dr = ImageDraw.Draw(img, "RGBA")
 
-    pr = (pending_ring_color or default_mc).lower()
+    pr = (pending_ring_color or "blue").lower()
     if pr not in ("blue", "red"):
-        pr = default_mc
+        pr = "blue"
     pend_line = _coach_pending_line_rgba(pr)
 
     groups: dict[tuple[float, float], list[tuple[int, dict]]] = defaultdict(list)
@@ -803,7 +823,7 @@ def composite_full_court_coach(
             r = 17
             mc = str(m.get("color", default_mc)).lower()
             if mc not in ("blue", "red"):
-                mc = default_mc
+                mc = "blue"
             mk_fill, mk_outline = _coach_marker_palette(mc)
             dr.ellipse(
                 (cx - r, cy - r, cx + r, cy + r),
@@ -1045,8 +1065,8 @@ def _render_coach_dashboard() -> None:
     with hdr_l:
         side_now = st.session_state.get("coach_side", "offence")
         st.markdown(
-            f"**Mode:** **{side_now.capitalize()}** — court tint follows mode (blue / red); "
-            "each marker’s **color** is chosen when you place it."
+            f"**Mode:** **{side_now.capitalize()}** — one half of the floor is **blue**, one **red** "
+            "(they **swap** when you switch offence/defence). Default marker color is **blue**; you can pick red in the panel."
         )
     with hdr_r:
         tgt = "Defence" if side_now == "offence" else "Offence"
@@ -1105,9 +1125,7 @@ def _render_coach_dashboard() -> None:
 
     if isinstance(pending, dict) and pending.get("x") is not None:
         if "coach_pcolor_radio" not in st.session_state:
-            st.session_state["coach_pcolor_radio"] = (
-                "Red" if str(side).lower() in ("defence", "defense") else "Blue"
-            )
+            st.session_state["coach_pcolor_radio"] = "Blue"
 
     pending_ring_color: str | None = None
     if isinstance(pending, dict) and pending.get("x") is not None:
@@ -1129,7 +1147,8 @@ def _render_coach_dashboard() -> None:
     )
 
     st.caption(
-        "Tap the court to pick a spot. Beside the court: choose **Blue** or **Red**, jersey #, then **Place marker**."
+        "Tap the court. Floor is **half blue / half red** (which side is which swaps with **Offence↔Defence**). "
+        "Default marker is **Blue** — use the radio for red. Then jersey # and **Place marker**."
     )
 
     dedup_k = f"_coach_fc_dedup_{pick}_{side}"
