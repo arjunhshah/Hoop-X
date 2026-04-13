@@ -2549,30 +2549,38 @@ def _render_active_session(active_sheet: str) -> None:
         )
         st.caption(
             "Tap the court — green = made, red = miss, gold = pending. "
-            "Tap near a marker to select a shot."
+            "Tap near a marker to select a shot. With a pending mark, **log** controls sit beside the court."
         )
         click_dedup = f"_court_click_{active_sheet}"
-        picked = streamlit_image_coordinates(
-            court_map_img,
-            width=COURT_IMG_W,
-            height=COURT_IMG_H,
-            key=f"jump_img_{active_sheet}",
-            use_column_width="always",
-        )
-        if picked is not None:
-            nx, ny = native_px_from_image_click(picked, COURT_IMG_W, COURT_IMG_H)
-            txy = (int(round(nx)), int(round(ny)))
-            if st.session_state.get(click_dedup) != txy:
-                st.session_state[click_dedup] = txy
-                cx, cy = pixel_to_court(nx, ny, COURT_IMG_W, COURT_IMG_H)
-                hit = find_shot_near_court_click(today_shots, cx, cy)
-                if hit is not None:
-                    st.session_state.court_inspect_id = hit["id"]
-                    st.session_state.pending_shot = None
-                else:
-                    st.session_state.court_inspect_id = None
-                    st.session_state.pending_shot = (cx, cy)
-                st.rerun()
+        has_mark = st.session_state.pending_shot is not None
+        if has_mark:
+            court_col, action_col = st.columns([3.35, 1])
+        else:
+            court_col = st.container()
+            action_col = None
+
+        with court_col:
+            picked = streamlit_image_coordinates(
+                court_map_img,
+                width=COURT_IMG_W,
+                height=COURT_IMG_H,
+                key=f"jump_img_{active_sheet}",
+                use_column_width="always",
+            )
+            if picked is not None:
+                nx, ny = native_px_from_image_click(picked, COURT_IMG_W, COURT_IMG_H)
+                txy = (int(round(nx)), int(round(ny)))
+                if st.session_state.get(click_dedup) != txy:
+                    st.session_state[click_dedup] = txy
+                    cx, cy = pixel_to_court(nx, ny, COURT_IMG_W, COURT_IMG_H)
+                    hit = find_shot_near_court_click(today_shots, cx, cy)
+                    if hit is not None:
+                        st.session_state.court_inspect_id = hit["id"]
+                        st.session_state.pending_shot = None
+                    else:
+                        st.session_state.court_inspect_id = None
+                        st.session_state.pending_shot = (cx, cy)
+                    st.rerun()
 
         if inspect_shot is not None:
             st.info(f"**Selected shot** · {format_shot_one_line(inspect_shot)}")
@@ -2580,16 +2588,36 @@ def _render_active_session(active_sheet: str) -> None:
                 st.session_state.court_inspect_id = None
                 st.rerun()
 
-        col_a, col_b, col_c = st.columns([1, 1, 1])
-        has_mark = st.session_state.pending_shot is not None
-        if col_a.button("Clear mark", type="secondary"):
-            st.session_state.pending_shot = None
-            st.session_state.court_inspect_id = None
-            st.session_state.pop(f"_court_click_{active_sheet}", None)
-            st.rerun()
-
-        log_made = col_b.button("Made", type="primary", disabled=not has_mark)
-        log_miss = col_c.button("Missed", type="secondary", disabled=not has_mark)
+        log_made = False
+        log_miss = False
+        if has_mark and action_col is not None:
+            with action_col:
+                with st.container(border=True):
+                    st.markdown("##### Log shot")
+                    px, py = st.session_state.pending_shot
+                    st.caption(f"**({float(px):.1f}, {float(py):.1f}) ft**")
+                    log_made = st.button(
+                        "Made",
+                        type="primary",
+                        key=f"jump_made_{active_sheet}",
+                        use_container_width=True,
+                    )
+                    log_miss = st.button(
+                        "Missed",
+                        type="secondary",
+                        key=f"jump_miss_{active_sheet}",
+                        use_container_width=True,
+                    )
+                    if st.button(
+                        "Clear mark",
+                        type="secondary",
+                        key=f"jump_clear_{active_sheet}",
+                        use_container_width=True,
+                    ):
+                        st.session_state.pending_shot = None
+                        st.session_state.court_inspect_id = None
+                        st.session_state.pop(f"_court_click_{active_sheet}", None)
+                        st.rerun()
 
         if log_made and has_mark:
             x, y = st.session_state.pending_shot
