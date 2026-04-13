@@ -859,6 +859,7 @@ def path_length_feet(pts: list[tuple[float, float]]) -> float:
 
 
 SHOTS_JSON_PATH = Path(__file__).resolve().parent / "data" / "shots.json"
+SHEET_META_PATH = Path(__file__).resolve().parent / "data" / "sheet_meta.json"
 
 
 def _shot_record_to_jsonable(rec: dict) -> dict:
@@ -916,7 +917,7 @@ class Base44:
             return 1
         return max(int(s["id"]) for s in self.shots if s.get("id") is not None) + 1
 
-    def list_shots(self, limit=500):
+    def list_shots(self, limit=10000):
         return sorted(self.shots, key=lambda s: s["created_date"], reverse=True)[:limit]
 
     def create_shot(self, data):
@@ -978,6 +979,90 @@ def get_base44():
     return st.session_state.base44
 
 
+def _default_sheet_meta() -> dict:
+    return {"player": {}, "coach": {}}
+
+
+def _load_sheet_meta() -> dict:
+    if not SHEET_META_PATH.is_file():
+        return _default_sheet_meta()
+    try:
+        raw = json.loads(SHEET_META_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return _default_sheet_meta()
+    if not isinstance(raw, dict):
+        return _default_sheet_meta()
+    out = _default_sheet_meta()
+    p, c = raw.get("player"), raw.get("coach")
+    if isinstance(p, dict):
+        out["player"] = {str(k): str(v)[:10] for k, v in p.items()}
+    if isinstance(c, dict):
+        out["coach"] = {str(k): str(v)[:10] for k, v in c.items()}
+    return out
+
+
+def _save_sheet_meta(meta: dict) -> None:
+    SHEET_META_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = SHEET_META_PATH.with_suffix(".json.tmp")
+    tmp.write_text(
+        json.dumps(meta, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    tmp.replace(SHEET_META_PATH)
+
+
+def record_sheet_created(kind: str, name: str, *, date_iso: str | None = None) -> None:
+    """Record first-seen date for a sheet (player practice sheet or coach play sheet)."""
+    if kind not in ("player", "coach") or not name:
+        return
+    meta = _load_sheet_meta()
+    if name in meta[kind]:
+        return
+    d = (date_iso or today_iso())[:10]
+    meta[kind][name] = d
+    _save_sheet_meta(meta)
+
+
+def remove_sheet_meta(kind: str, name: str) -> None:
+    if kind not in ("player", "coach") or not name:
+        return
+    meta = _load_sheet_meta()
+    if name in meta[kind]:
+        del meta[kind][name]
+        _save_sheet_meta(meta)
+
+
+def get_sheet_created_iso(kind: str, name: str) -> str | None:
+    return _load_sheet_meta().get(kind, {}).get(name)
+
+
+def ensure_sheet_metadata(base44: Base44) -> None:
+    """Backfill `sheet_meta.json` from shot dates (player) or today (coach)."""
+    meta = _load_sheet_meta()
+    changed = False
+    all_shots = base44.list_shots(limit=5000)
+
+    def _earliest_shot_day(sheet_name: str) -> str | None:
+        dates: list[str] = []
+        for s in all_shots:
+            if s.get("session_name") == sheet_name:
+                dates.append(s["created_date"].date().isoformat())
+        return min(dates) if dates else None
+
+    for nm in list(st.session_state.get("sheets") or []):
+        if nm not in meta["player"]:
+            meta["player"][nm] = _earliest_shot_day(nm) or today_iso()
+            changed = True
+
+    for nm in list(st.session_state.get("coach_sheets") or []):
+        if nm not in meta["coach"]:
+            meta["coach"][nm] = today_iso()
+            changed = True
+
+    if changed:
+        _save_sheet_meta(meta)
+
+
 def today_iso():
     return datetime.date.today().isoformat()
 
@@ -1004,8 +1089,12 @@ def _render_home_sheet_cell(sheet: str, idx: int, shots_today_list: list) -> Non
     else:
         stat_line = "No shots yet today"
 
+    created = get_sheet_created_iso("player", sheet)
     st.markdown(f"**{sheet}**")
-    st.caption(stat_line)
+    if created:
+        st.caption(f"{stat_line} · created **{created}**")
+    else:
+        st.caption(stat_line)
     exp_label = f"Today’s shots ({tot})" if tot else "Today’s shots (0)"
     with st.expander(exp_label, expanded=False):
         if not sub_shots:
@@ -1084,6 +1173,7 @@ def _render_coach_dashboard() -> None:
             if name:
                 if name not in st.session_state.coach_sheets:
                     st.session_state.coach_sheets.append(name)
+                    record_sheet_created("coach", name)
                 st.session_state.coach_active_sheet = name
                 st.session_state.coach_pending = None
                 st.rerun()
@@ -1102,6 +1192,9 @@ def _render_coach_dashboard() -> None:
         st.session_state.coach_pending = None
     st.session_state._coach_ui_prev_sheet = pick
     st.session_state.coach_active_sheet = pick
+    c_created = get_sheet_created_iso("coach", pick)
+    if c_created:
+        st.caption(f"Play sheet created **{c_created}**")
 
     side = st.session_state.get("coach_side", "offence")
     mk = _coach_markers_storage_key(pick, side)
@@ -1125,7 +1218,7 @@ def _render_coach_dashboard() -> None:
 
     st.caption(
         "Tap the court. Floor is **half blue / half red** (swaps with **Offence↔Defence**). "
-        "Markers are always **blue** on both halves. Enter jersey #, then **Place marker**."
+        "Markers are always **blue**. After you tap, the jersey row sits **right above** the full-width court."
     )
 
     dedup_k = f"_coach_fc_dedup_{pick}_{side}"
@@ -1145,60 +1238,64 @@ def _render_coach_dashboard() -> None:
             st.rerun()
 
     if pending:
-        form_col, court_col = st.columns([1, 2.35])
-        with form_col:
-            with st.container(border=True):
-                st.markdown("##### New marker")
-                st.caption(
-                    f"**Spot (ft):** ({float(pending['x']):.1f}, {float(pending['y']):.1f})"
-                )
+        with st.container(border=True):
+            st.markdown(
+                f"##### New marker · **({float(pending['x']):.1f}, {float(pending['y']):.1f}) ft**"
+            )
+            st.caption("Type the number for this spot — the court below stays full width.")
+            in_col, pl_col, ca_col = st.columns([4, 1, 1])
+            with in_col:
                 st.text_input(
                     "Jersey #",
                     key="coach_jersey_txt",
                     max_chars=6,
                     placeholder="e.g. 23",
                 )
-                place_key = f"coach_place_{mk}"
-                cancel_key = f"coach_cancel_{mk}"
-                if st.button("Place marker", type="primary", key=place_key, use_container_width=True):
-                    num = str(st.session_state.get("coach_jersey_txt", "")).strip() or "?"
-                    nid = int(st.session_state.get("coach_marker_seq", 1))
-                    st.session_state.coach_marker_seq = nid + 1
-                    markers.append(
-                        {
-                            "id": nid,
-                            "x": float(pending["x"]),
-                            "y": float(pending["y"]),
-                            "number": num,
-                            "color": "blue",
-                        }
-                    )
-                    st.session_state.coach_markers[mk] = markers
-                    st.session_state.coach_pending = None
-                    st.session_state.pop("coach_jersey_txt", None)
-                    st.rerun()
-                if st.button("Cancel", key=cancel_key, use_container_width=True):
-                    st.session_state.coach_pending = None
-                    st.session_state.pop("coach_jersey_txt", None)
-                    st.rerun()
-        with court_col:
-            picked = streamlit_image_coordinates(
-                court_rgb,
-                width=FULL_COURT_IMG_W,
-                height=FULL_COURT_IMG_H,
-                key=img_key,
-                use_column_width="always",
+            place_key = f"coach_place_{mk}"
+            cancel_key = f"coach_cancel_{mk}"
+            with pl_col:
+                place_b = st.button(
+                    "Place",
+                    type="primary",
+                    key=place_key,
+                    use_container_width=True,
+                )
+            with ca_col:
+                cancel_b = st.button(
+                    "Cancel",
+                    key=cancel_key,
+                    use_container_width=True,
+                )
+        if place_b:
+            num = str(st.session_state.get("coach_jersey_txt", "")).strip() or "?"
+            nid = int(st.session_state.get("coach_marker_seq", 1))
+            st.session_state.coach_marker_seq = nid + 1
+            markers.append(
+                {
+                    "id": nid,
+                    "x": float(pending["x"]),
+                    "y": float(pending["y"]),
+                    "number": num,
+                    "color": "blue",
+                }
             )
-            _coach_process_court_click(picked)
-    else:
-        picked = streamlit_image_coordinates(
-            court_rgb,
-            width=FULL_COURT_IMG_W,
-            height=FULL_COURT_IMG_H,
-            key=img_key,
-            use_column_width="always",
-        )
-        _coach_process_court_click(picked)
+            st.session_state.coach_markers[mk] = markers
+            st.session_state.coach_pending = None
+            st.session_state.pop("coach_jersey_txt", None)
+            st.rerun()
+        if cancel_b:
+            st.session_state.coach_pending = None
+            st.session_state.pop("coach_jersey_txt", None)
+            st.rerun()
+
+    picked = streamlit_image_coordinates(
+        court_rgb,
+        width=FULL_COURT_IMG_W,
+        height=FULL_COURT_IMG_H,
+        key=img_key,
+        use_column_width="always",
+    )
+    _coach_process_court_click(picked)
 
     u1, u2 = st.columns(2)
     if u1.button("Undo last marker", key="coach_undo_mk", disabled=len(markers) == 0):
@@ -1524,6 +1621,193 @@ def _jump_vs_layup_counts_chart_png(jump_total: int, layup_total: int) -> bytes:
     return out.getvalue()
 
 
+def aggregate_shots_by_day(all_shots: list) -> list[dict]:
+    """Chronological rows: days with ≥1 shot, with made/miss counts and FG%."""
+    by_day: dict[str, dict[str, int]] = {}
+    for s in all_shots:
+        d = s["created_date"].date().isoformat()
+        if d not in by_day:
+            by_day[d] = {"made": 0, "missed": 0}
+        if s["result"] == "made":
+            by_day[d]["made"] += 1
+        else:
+            by_day[d]["missed"] += 1
+    rows: list[dict] = []
+    for d in sorted(by_day.keys()):
+        m = by_day[d]["made"]
+        x = by_day[d]["missed"]
+        t = m + x
+        pct = round(100.0 * m / t, 1) if t else 0.0
+        rows.append(
+            {"date": d, "made": m, "missed": x, "total": t, "fg_pct": pct}
+        )
+    return rows
+
+
+def _overview_daily_fg_line_png(rows: list[dict]) -> bytes | None:
+    """Line + markers: FG% on each day you logged shots."""
+    if not rows:
+        return None
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    xs = np.arange(len(rows), dtype=float)
+    ys = [float(r["fg_pct"]) for r in rows]
+    labels = [r["date"][5:] if len(r["date"]) >= 10 else r["date"] for r in rows]
+    fig, ax = plt.subplots(figsize=(6.2, 3.2))
+    fig.patch.set_facecolor("#0d0d0d")
+    ax.set_facecolor("#111111")
+    ax.plot(
+        xs,
+        ys,
+        color="#4ade80",
+        linewidth=2.2,
+        marker="o",
+        markersize=7,
+        markerfacecolor="#22c55e",
+        markeredgecolor="#bbf7d0",
+    )
+    ax.set_xticks(xs)
+    ax.set_xticklabels(labels, rotation=35, ha="right", color="#a3a3a3", fontsize=8)
+    ax.set_ylabel("FG% (that day)", color="#a3a3a3", fontsize=10)
+    ax.set_ylim(0, 100)
+    ax.grid(axis="y", color="#2a2a2a", linestyle="-", linewidth=0.6, alpha=0.95)
+    ax.tick_params(axis="y", colors="#888888", labelsize=8)
+    for spine in ax.spines.values():
+        spine.set_color("#333333")
+    ax.set_title("FG% by day played (connected)", color="#e5e5e5", fontsize=11, pad=10)
+    plt.tight_layout()
+    out = io.BytesIO()
+    fig.savefig(out, format="png", dpi=96, facecolor="#0d0d0d", bbox_inches="tight")
+    plt.close(fig)
+    return out.getvalue()
+
+
+def _overview_daily_volume_bar_png(rows: list[dict]) -> bytes | None:
+    """Stacked made vs missed per day."""
+    if not rows:
+        return None
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    xs = np.arange(len(rows), dtype=float)
+    made = [r["made"] for r in rows]
+    miss = [r["missed"] for r in rows]
+    labels = [r["date"][5:] for r in rows]
+    w = 0.72
+    fig, ax = plt.subplots(figsize=(6.2, 3.0))
+    fig.patch.set_facecolor("#0d0d0d")
+    ax.set_facecolor("#111111")
+    ax.bar(xs, made, w, label="Made", color="#4ade80", edgecolor="#2a2a2a")
+    ax.bar(xs, miss, w, bottom=made, label="Missed", color="#f87171", edgecolor="#2a2a2a")
+    ax.set_xticks(xs)
+    ax.set_xticklabels(labels, rotation=35, ha="right", color="#a3a3a3", fontsize=8)
+    ax.set_ylabel("Shots", color="#a3a3a3", fontsize=10)
+    ax.legend(facecolor="#1a1a1a", edgecolor="#333", labelcolor="#e5e5e5", fontsize=8)
+    ax.grid(axis="y", color="#2a2a2a", linestyle="-", linewidth=0.6, alpha=0.95)
+    ax.tick_params(axis="y", colors="#888888", labelsize=8)
+    for spine in ax.spines.values():
+        spine.set_color("#333333")
+    ax.set_title("Volume by day (made vs missed)", color="#e5e5e5", fontsize=11, pad=10)
+    plt.tight_layout()
+    out = io.BytesIO()
+    fig.savefig(out, format="png", dpi=96, facecolor="#0d0d0d", bbox_inches="tight")
+    plt.close(fig)
+    return out.getvalue()
+
+
+def _overview_running_fg_alltime_png(all_shots: list) -> bytes | None:
+    """Running FG% across all shots in chronological order."""
+    if len(all_shots) < 2:
+        return None
+    ordered = sorted(all_shots, key=lambda s: s["created_date"])
+    running: list[float] = []
+    made = 0
+    for i, s in enumerate(ordered, start=1):
+        if s["result"] == "made":
+            made += 1
+        running.append(100.0 * made / i)
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    xs = np.arange(1, len(running) + 1, dtype=float)
+    fig, ax = plt.subplots(figsize=(6.2, 2.9))
+    fig.patch.set_facecolor("#0d0d0d")
+    ax.set_facecolor("#111111")
+    if len(running) <= 48:
+        ax.plot(
+            xs,
+            running,
+            color="#60a5fa",
+            linewidth=2.0,
+            marker="o",
+            markersize=3,
+        )
+    else:
+        ax.plot(xs, running, color="#60a5fa", linewidth=1.8)
+    ax.fill_between(xs, running, alpha=0.1, color="#60a5fa")
+    ax.set_xlabel("Shot # (all-time)", color="#a3a3a3", fontsize=10)
+    ax.set_ylabel("Running FG %", color="#a3a3a3", fontsize=10)
+    ax.set_ylim(0, 100)
+    ax.grid(axis="y", color="#2a2a2a", linestyle="-", linewidth=0.6, alpha=0.95)
+    ax.tick_params(axis="both", colors="#888888", labelsize=8)
+    for spine in ax.spines.values():
+        spine.set_color("#333333")
+    ax.set_title("All-time running accuracy", color="#e5e5e5", fontsize=11, pad=10)
+    plt.tight_layout()
+    out = io.BytesIO()
+    fig.savefig(out, format="png", dpi=96, facecolor="#0d0d0d", bbox_inches="tight")
+    plt.close(fig)
+    return out.getvalue()
+
+
+def _overview_sessions_per_week_png(rows: list[dict]) -> bytes | None:
+    """Bar: number of active days per ISO week (Mon–Sun)."""
+    if not rows:
+        return None
+    from collections import defaultdict
+
+    wk: dict[str, int] = defaultdict(int)
+    for r in rows:
+        dt = datetime.date.fromisoformat(r["date"])
+        iso_y, iso_w, _ = dt.isocalendar()
+        key = f"{iso_y}-W{iso_w:02d}"
+        wk[key] += 1
+    keys = sorted(wk.keys())
+    if not keys:
+        return None
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    vals = [wk[k] for k in keys]
+    xs = np.arange(len(keys), dtype=float)
+    fig, ax = plt.subplots(figsize=(6.0, 2.6))
+    fig.patch.set_facecolor("#0d0d0d")
+    ax.set_facecolor("#111111")
+    ax.bar(xs, vals, 0.65, color="#fbbf24", edgecolor="#2a2a2a")
+    ax.set_xticks(xs)
+    ax.set_xticklabels(keys, rotation=40, ha="right", color="#a3a3a3", fontsize=7)
+    ax.set_ylabel("Days with shots", color="#a3a3a3", fontsize=9)
+    ax.grid(axis="y", color="#2a2a2a", linestyle="-", linewidth=0.6, alpha=0.95)
+    ax.tick_params(axis="y", colors="#888888", labelsize=8)
+    for spine in ax.spines.values():
+        spine.set_color("#333333")
+    ax.set_title("Training frequency (days per week)", color="#e5e5e5", fontsize=11, pad=8)
+    plt.tight_layout()
+    out = io.BytesIO()
+    fig.savefig(out, format="png", dpi=96, facecolor="#0d0d0d", bbox_inches="tight")
+    plt.close(fig)
+    return out.getvalue()
+
+
 def build_coach_feedback(
     skills: dict,
     sheet_name: str,
@@ -1598,6 +1882,114 @@ def build_coach_feedback(
     return "\n".join(lines)
 
 
+def build_overview_feedback(
+    rows: list[dict],
+    total_shots: int,
+    overall_pct: float,
+) -> str:
+    """Rule-based coaching copy from all-time daily aggregates (no external API)."""
+    n_days = len(rows)
+    if total_shots == 0:
+        return (
+            "### AI coach · **Player overview**\n"
+            "No shots in your history yet. Open a **sheet**, use **Court session**, and log makes and misses — "
+            "this page will chart **FG% on each day you play** and how volume trends over time."
+        )
+
+    lines: list[str] = ["### AI coach · **Player overview**"]
+    lines.append(
+        f"- **Summary:** **{total_shots}** shots on **{n_days}** day{'s' if n_days != 1 else ''} with activity — **{overall_pct:.1f}%** FG overall."
+    )
+
+    if n_days >= 2:
+        mid = max(1, n_days // 2)
+        early, late = rows[:mid], rows[mid:]
+
+        def _blend(rr: list[dict]) -> float:
+            m = sum(r["made"] for r in rr)
+            t = sum(r["total"] for r in rr)
+            return 100.0 * m / t if t else 0.0
+
+        efg, lfg = _blend(early), _blend(late)
+        if lfg > efg + 5:
+            lines.append(
+                f"- **Trend:** Recent days are running hotter than your earlier stretch (**~{lfg:.0f}%** vs **~{efg:.0f}%** blended by day). Keep the same pre-shot habits."
+            )
+        elif efg > lfg + 5:
+            lines.append(
+                f"- **Trend:** Your earlier days were stronger (**~{efg:.0f}%** vs **~{lfg:.0f}%** lately). Check fatigue, shot selection, or add warm-up volume."
+            )
+        else:
+            lines.append(
+                "- **Trend:** Day-to-day FG% is fairly steady — good baseline. Add game-speed reps or contested looks to stress-test."
+            )
+
+    last = rows[-1]
+    lines.append(
+        f"- **Latest day with shots:** **{last['date']}** — **{last['fg_pct']:.0f}%** on **{last['total']}** attempts."
+    )
+
+    hi = max(rows, key=lambda r: r["total"])
+    if hi["total"] >= 15:
+        lines.append(
+            f"- **Volume:** Your busiest day was **{hi['date']}** (**{hi['total']}** attempts) — big work; watch recovery the next day."
+        )
+    elif total_shots < 25:
+        lines.append(
+            "- **Sample:** Keep logging — more days and shots make these trends much more reliable."
+        )
+
+    return "\n".join(lines)
+
+
+def _overview_context_for_llm(
+    rows: list[dict],
+    total: int,
+    made: int,
+    missed: int,
+    overall_pct: float,
+) -> str:
+    lines = [
+        "Page: Player overview (all practice sheets combined, all calendar days).",
+        f"Lifetime totals — attempts: {total}, made: {made}, missed: {missed}, FG%: {overall_pct:.1f}",
+        f"Distinct days with at least one shot: {len(rows)}",
+    ]
+    if rows:
+        tail = rows[-21:] if len(rows) > 21 else rows
+        lines.append("Recent days (date, attempts, FG%):")
+        for r in tail:
+            lines.append(f"  {r['date']}: {r['total']} att, {r['fg_pct']}%")
+    return "\n".join(lines)
+
+
+def _overview_rule_reply(
+    question: str,
+    rows: list[dict],
+    overall_pct: float,
+    total: int,
+) -> str:
+    q = question.lower().strip()
+    if total == 0:
+        return "Log shots from any sheet first — then we can talk trends."
+    if any(x in q for x in ("trend", "improv", "better", "focus")):
+        if len(rows) >= 2:
+            last_pct = rows[-1]["fg_pct"]
+            return (
+                f"Overall you are at **{overall_pct:.1f}%** across **{total}** shots. "
+                f"Your most recent active day finished at **{last_pct:.0f}%** — compare that to the **FG% by day** chart and keep what worked that day."
+            )
+        return f"You are at **{overall_pct:.1f}%** over **{total}** shots — add more training days to see a clearer trend line."
+    if "hello" in q or q in ("hi", "hey"):
+        return (
+            f"Hey — you have **{total}** shots logged over **{len(rows)}** days at **{overall_pct:.1f}%**. "
+            "Ask about consistency, volume, or what to emphasize next."
+        )
+    return (
+        "I can discuss **day-to-day FG%**, **volume patterns**, or how to **build on your last session**. "
+        "Add **OPENAI_API_KEY** for richer conversational answers."
+    )
+
+
 _COACH_SYSTEM = """You are a supportive basketball skills coach for someone using the Hoop-X training app.
 Use ONLY the statistics in the context block; do not invent games, teammates, or numbers not given.
 Answer in a friendly, concise way (short paragraphs unless the player asks for detail).
@@ -1661,6 +2053,8 @@ def _initial_coach_messages(skills: dict, sheet_name: str, overall_total: int) -
 def _coach_openai_reply(
     history: list[dict],
     stats_context: str,
+    *,
+    bootstrap_user: str | None = None,
 ) -> str:
     from openai import OpenAI
 
@@ -1675,7 +2069,8 @@ def _coach_openai_reply(
         api_messages.append(
             {
                 "role": "user",
-                "content": "I'm on my skills page — what stands out from my stats?",
+                "content": bootstrap_user
+                or "I'm on my skills page — what stands out from my stats?",
             }
         )
     for m in h:
@@ -1898,6 +2293,127 @@ def _render_coach_chat(
         history.append({"role": "assistant", "content": reply})
         chats[active_sheet] = history
         st.rerun()
+
+
+def _overview_coach_reply(
+    history: list[dict],
+    stats_ctx: str,
+    rows: list[dict],
+    overall_pct: float,
+    total: int,
+) -> str:
+    last = history[-1]["content"] if history else ""
+    key = _get_openai_api_key()
+    if key:
+        try:
+            return _coach_openai_reply(
+                history,
+                stats_ctx,
+                bootstrap_user=(
+                    "I'm on the Player overview page with multi-day stats — what stands out?"
+                ),
+            )
+        except Exception as e:
+            err = _overview_rule_reply(last, rows, overall_pct, total)
+            return f"{err}\n\n*(Quick mode: {type(e).__name__}.)*"
+    return _overview_rule_reply(last, rows, overall_pct, total)
+
+
+def _render_overview_coach(
+    rows: list[dict],
+    total: int,
+    made: int,
+    missed: int,
+    overall_pct: float,
+) -> None:
+    stats_ctx = _overview_context_for_llm(rows, total, made, missed, overall_pct)
+    opening = (
+        build_overview_feedback(rows, total, overall_pct)
+        + "\n\n---\n**Ask me anything** about your trends, volume, or what to emphasize next."
+    )
+    hist: list[dict] = st.session_state.setdefault("overview_coach_chat", [])
+    if not hist:
+        hist.append({"role": "assistant", "content": opening})
+
+    st.write("##### AI coach")
+    if _get_openai_api_key():
+        st.caption("Feedback on your charts — ask follow-ups about trends or training focus.")
+    else:
+        st.caption(
+            "**Quick mode** from your overview stats. "
+            "Set **OPENAI_API_KEY** for fuller conversational coaching."
+        )
+
+    h1, h2 = st.columns([4, 1])
+    with h2:
+        if st.button("Clear chat", key="overview_coach_clear"):
+            st.session_state.overview_coach_chat = [
+                {"role": "assistant", "content": opening}
+            ]
+            st.rerun()
+
+    for m in hist:
+        with st.chat_message(m["role"]):
+            st.markdown(m["content"])
+
+    if prompt := st.chat_input("Ask about your trends…", key="overview_coach_in"):
+        hist.append({"role": "user", "content": prompt})
+        reply = _overview_coach_reply(hist, stats_ctx, rows, overall_pct, total)
+        hist.append({"role": "assistant", "content": reply})
+        st.session_state.overview_coach_chat = hist
+        st.rerun()
+
+
+def _render_player_overview(all_shots: list) -> None:
+    """Home: all-time trends, charts, and overview AI coach."""
+    st.subheader("Player overview")
+    st.caption(
+        "All practice sheets combined. **FG% by day** connects only **days you logged shots**. "
+        "Sheets show a **created** date on the home grid and in Coach view."
+    )
+    rows = aggregate_shots_by_day(all_shots)
+    made = sum(1 for s in all_shots if s["result"] == "made")
+    missed = sum(1 for s in all_shots if s["result"] == "missed")
+    total = made + missed
+    overall_pct = round(100 * made / total, 1) if total else 0.0
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total shots", total)
+    m2.metric("Days played", len(rows))
+    m3.metric("Made / missed", f"{made} / {missed}")
+    m4.metric("Overall FG%", f"{overall_pct}%" if total else "—")
+
+    g1, g2 = st.columns(2)
+    with g1:
+        buf = _overview_daily_fg_line_png(rows)
+        if buf:
+            st.image(io.BytesIO(buf), use_container_width=True)
+        else:
+            st.caption("No shots yet — log from any sheet to see daily FG%.")
+
+    with g2:
+        buf2 = _overview_daily_volume_bar_png(rows)
+        if buf2:
+            st.image(io.BytesIO(buf2), use_container_width=True)
+        else:
+            st.caption("Volume chart appears once you have logged shots.")
+
+    g3, g4 = st.columns(2)
+    with g3:
+        buf3 = _overview_running_fg_alltime_png(all_shots)
+        if buf3:
+            st.image(io.BytesIO(buf3), use_container_width=True)
+        else:
+            st.caption("Log at least two shots to see all-time running FG%.")
+
+    with g4:
+        buf4 = _overview_sessions_per_week_png(rows)
+        if buf4:
+            st.image(io.BytesIO(buf4), use_container_width=True)
+        else:
+            st.caption("Training frequency by week appears after you have activity.")
+
+    _render_overview_coach(rows, total, made, missed, overall_pct)
 
 
 def _render_skills_page(active_sheet: str) -> None:
@@ -2234,6 +2750,7 @@ def tracker_app():
     st.markdown(DARK_CSS, unsafe_allow_html=True)
 
     base44 = get_base44()
+    ensure_sheet_metadata(base44)
 
     with st.sidebar:
         st.markdown("### Sheets")
@@ -2243,6 +2760,7 @@ def tracker_app():
             s = new_sheet.strip()
             if s not in st.session_state.sheets:
                 st.session_state.sheets.append(s)
+                record_sheet_created("player", s)
             st.rerun()
 
         sheet_options = list(st.session_state.sheets)
@@ -2258,12 +2776,13 @@ def tracker_app():
         if st.button("Remove selected sheet", type="secondary"):
             if len(st.session_state.sheets) > 1 and remove_target in st.session_state.sheets:
                 st.session_state.sheets.remove(remove_target)
+                remove_sheet_meta("player", remove_target)
                 if st.session_state.active_session == remove_target:
                     st.session_state.active_session = None
                     st.session_state.pending_shot = None
                 st.rerun()
 
-    all_shots = base44.list_shots()
+    all_shots = base44.list_shots(limit=10000)
     shots_today_list = shots_today(all_shots)
     active_sheet = st.session_state.active_session
 
@@ -2306,7 +2825,7 @@ def tracker_app():
     st.session_state._last_active_sheet = None
     st.session_state._last_shot_mode = None
 
-    home_l, home_r = st.columns([5, 1])
+    home_l, home_r = st.columns([4, 2])
     with home_l:
         st.title("Hoop-X")
         st.markdown(
@@ -2314,26 +2833,44 @@ def tracker_app():
             unsafe_allow_html=True,
         )
     with home_r:
-        hv = st.session_state.get("home_dashboard_view", "player")
-        if hv == "player":
+        hv0 = st.session_state.get("home_dashboard_view", "player")
+        db1, db2, db3 = st.columns(3)
+        with db1:
             if st.button(
-                "Coach view",
-                key="dash_switch_coach",
+                "Player",
+                key="dash_tab_player",
                 use_container_width=True,
-            ):
-                st.session_state.home_dashboard_view = "coach"
-                st.rerun()
-        else:
-            if st.button(
-                "Player view",
-                key="dash_switch_player",
-                use_container_width=True,
+                type="primary" if hv0 == "player" else "secondary",
+                disabled=hv0 == "player",
             ):
                 st.session_state.home_dashboard_view = "player"
                 st.rerun()
+        with db2:
+            if st.button(
+                "Coach",
+                key="dash_tab_coach",
+                use_container_width=True,
+                type="primary" if hv0 == "coach" else "secondary",
+                disabled=hv0 == "coach",
+            ):
+                st.session_state.home_dashboard_view = "coach"
+                st.rerun()
+        with db3:
+            if st.button(
+                "Overview",
+                key="dash_tab_overview",
+                use_container_width=True,
+                type="primary" if hv0 == "overview" else "secondary",
+                disabled=hv0 == "overview",
+            ):
+                st.session_state.home_dashboard_view = "overview"
+                st.rerun()
 
-    if st.session_state.get("home_dashboard_view", "player") == "coach":
+    hv = st.session_state.get("home_dashboard_view", "player")
+    if hv == "coach":
         _render_coach_dashboard()
+    elif hv == "overview":
+        _render_player_overview(all_shots)
     else:
         _render_player_dashboard(shots_today_list)
 

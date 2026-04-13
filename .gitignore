@@ -32,3 +32,5 @@ Thumbs.db
 # Local shot history (JSON persistence next to swish.py)
 data/shots.json
 data/shots.json.tmp
+data/sheet_meta.json
+data/sheet_meta.json.tmp
