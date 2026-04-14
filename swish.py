@@ -74,8 +74,6 @@ COURT_X0, COURT_X1 = -25.0, 25.0
 COURT_Y0, COURT_Y1 = 0.0, 47.0
 HOOP = (0.0, 5.25)  # 5'3" — baseline to center of ring
 RIM_R = 0.75  # 18" diameter rim → 9" radius
-# Top-down: 72" backboard → 6' wide; line sits tangent to rim toward baseline.
-BACKBOARD_HALF_WIDTH_FT = 3.0
 # Concentric shot-distance rings from hoop (ft); 23'9" is already the 3pt outline.
 SHOT_RANGE_ARCS_FT = (5.0, 10.0, 15.0, 20.0)
 FT_Y = 19.0  # baseline to free-throw line
@@ -344,16 +342,20 @@ def build_nba_halfcourt_image(w: int, h: int) -> Image.Image:
     for i in range(len(pts_rs) - 1):
         dr.line([pts_rs[i], pts_rs[i + 1]], fill="#ffffff", width=2)
 
-    # Backboard (top view): thick segment behind the rim, tangent on the baseline side.
+    # Backboard (top view): thick horizontal behind the orange hoop, tangent to the rim on the
+    # baseline side; length spans to the restricted semicircle (intersection with radius RESTRICTED_R_FT).
     y_bb = hy - RIM_R
+    dx_bb = float(
+        np.sqrt(max(0.0, RESTRICTED_R_FT**2 - RIM_R**2))
+    )
     fline(
         dr,
-        hx - BACKBOARD_HALF_WIDTH_FT,
+        hx - dx_bb,
         y_bb,
-        hx + BACKBOARD_HALF_WIDTH_FT,
+        hx + dx_bb,
         y_bb,
-        width=6,
-        fill="#f2f2f2",
+        width=12,
+        fill="#f0f0f0",
     )
 
     th = np.linspace(0, 2 * np.pi, 36)
@@ -455,7 +457,7 @@ def build_nba_fullcourt_image(w: int, h: int) -> Image.Image:
 
 
 # Bump to invalidate @st.cache_data on Streamlit Cloud when court graphics change.
-_COURT_BITMAP_CACHE_VERSION = 6
+_COURT_BITMAP_CACHE_VERSION = 7
 
 
 @st.cache_data(show_spinner=False)
