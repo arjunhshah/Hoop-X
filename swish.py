@@ -74,6 +74,10 @@ COURT_X0, COURT_X1 = -25.0, 25.0
 COURT_Y0, COURT_Y1 = 0.0, 47.0
 HOOP = (0.0, 5.25)  # 5'3" — baseline to center of ring
 RIM_R = 0.75  # 18" diameter rim → 9" radius
+# Top-down: 72" backboard → 6' wide; line sits tangent to rim toward baseline.
+BACKBOARD_HALF_WIDTH_FT = 3.0
+# Concentric shot-distance rings from hoop (ft); 23'9" is already the 3pt outline.
+SHOT_RANGE_ARCS_FT = (5.0, 10.0, 15.0, 20.0)
 FT_Y = 19.0  # baseline to free-throw line
 PAINT_X = 8.0  # half of 16' lane width
 THREE_R = 23.75  # 23'9" arc from basket center
@@ -102,6 +106,11 @@ FULL_COURT_IMG_H = int(
 )
 # Inset mapping so baselines / 3pt lines aren’t clipped by thick strokes at bitmap edges
 COURT_VIEW_MARGIN_PX = 8
+
+def distance_from_hoop_ft(cx: float, cy: float) -> float:
+    """Straight-line distance in feet from (cx, cy) to the rim center (half-court coords)."""
+    return float(np.hypot(float(cx) - HOOP[0], float(cy) - HOOP[1]))
+
 
 def clamp_court(x: float, y: float):
     return (
@@ -256,11 +265,17 @@ def format_shot_one_line(shot: dict) -> str:
     t = shot["created_date"].strftime("%H:%M:%S")
     res = shot["result"].upper()
     if shot.get("shot_kind") == "layup":
-        n = len(layup_path_to_pairs(shot.get("layup_path") or []))
+        pairs = layup_path_to_pairs(shot.get("layup_path") or [])
+        n = len(pairs)
+        if pairs:
+            lx, ly = pairs[-1]
+            d = distance_from_hoop_ft(lx, ly)
+            return f"{res} layup · {n} pts · {d:.1f} ft from hoop · {t}"
         return f"{res} layup · {n} pts · {t}"
     cx, cy = shot.get("court_x"), shot.get("court_y")
     if cx is not None and cy is not None:
-        return f"{res} jump · ({float(cx):.1f}, {float(cy):.1f}) ft · {t}"
+        d = distance_from_hoop_ft(float(cx), float(cy))
+        return f"{res} jump · {d:.1f} ft from hoop · {t}"
     return f"{res} · {t}"
 
 
@@ -329,6 +344,18 @@ def build_nba_halfcourt_image(w: int, h: int) -> Image.Image:
     for i in range(len(pts_rs) - 1):
         dr.line([pts_rs[i], pts_rs[i + 1]], fill="#ffffff", width=2)
 
+    # Backboard (top view): thick segment behind the rim, tangent on the baseline side.
+    y_bb = hy - RIM_R
+    fline(
+        dr,
+        hx - BACKBOARD_HALF_WIDTH_FT,
+        y_bb,
+        hx + BACKBOARD_HALF_WIDTH_FT,
+        y_bb,
+        width=6,
+        fill="#f2f2f2",
+    )
+
     th = np.linspace(0, 2 * np.pi, 36)
     pts3 = [
         feet_to_pixel(
@@ -338,6 +365,24 @@ def build_nba_halfcourt_image(w: int, h: int) -> Image.Image:
     ]
     for i in range(len(pts3) - 1):
         dr.line([pts3[i], pts3[i + 1]], fill="#ff6b2d", width=3)
+
+    # Distance rings: constant radius from rim center in feet (same construction as the 3pt arc).
+    arc_col, arc_w = "#7d8fa3", 2
+    for ring_r in SHOT_RANGE_ARCS_FT:
+        if ring_r <= 0 or ring_r >= THREE_R:
+            continue
+        poly_ring: list[tuple[float, float]] = []
+        x_max = min(COURT_X1, ring_r)
+        for xv in np.linspace(-x_max, x_max, 96):
+            d2 = ring_r**2 - float(xv) ** 2
+            if d2 < 0:
+                continue
+            yv = hy + float(np.sqrt(d2))
+            if yv > COURT_Y1 + 0.01:
+                continue
+            poly_ring.append(feet_to_pixel(float(xv), yv, w, h))
+        for i in range(len(poly_ring) - 1):
+            dr.line([poly_ring[i], poly_ring[i + 1]], fill=arc_col, width=arc_w)
 
     # Three-point line: baseline → vertical (3' inside sideline) → 23'9" arc → vertical → baseline
     poly_3 = []
@@ -410,7 +455,7 @@ def build_nba_fullcourt_image(w: int, h: int) -> Image.Image:
 
 
 # Bump to invalidate @st.cache_data on Streamlit Cloud when court graphics change.
-_COURT_BITMAP_CACHE_VERSION = 5
+_COURT_BITMAP_CACHE_VERSION = 6
 
 
 @st.cache_data(show_spinner=False)
@@ -1077,6 +1122,18 @@ def sheet_button_key(sheet: str, idx: int) -> str:
     return f"open_sheet_{idx}_{safe}"
 
 
+def _jump_court_widget_key(active_sheet: str) -> str:
+    """Versioned key so we can remount ``streamlit_image_coordinates`` after clear / log."""
+    rev = int(st.session_state.get(f"_jump_court_rev_{active_sheet}", 0))
+    return f"jump_img_{active_sheet}_{rev}"
+
+
+def _bump_jump_court_widget(active_sheet: str) -> None:
+    """Remount the half-court picker so the last click is not replayed on the next run."""
+    k = f"_jump_court_rev_{active_sheet}"
+    st.session_state[k] = int(st.session_state.get(k, 0)) + 1
+
+
 def _render_home_sheet_cell(sheet: str, idx: int, shots_today_list: list) -> None:
     """Compact dashboard tile: name, stats, shot list expander, Open button."""
     sub_shots = [s for s in shots_today_list if s.get("session_name") == sheet]
@@ -1383,11 +1440,20 @@ def _render_player_dashboard(shots_today_list: list) -> None:
         for shot in recent:
             sheet = shot.get("session_name", "—")
             if shot.get("shot_kind") == "layup":
-                n = len(layup_path_to_pairs(shot.get("layup_path") or []))
-                loc = f" layup ({n} pts)"
+                pairs = layup_path_to_pairs(shot.get("layup_path") or [])
+                n = len(pairs)
+                if pairs:
+                    lx, ly = pairs[-1]
+                    loc = f" layup ({n} pts, {distance_from_hoop_ft(lx, ly):.0f}' rim)"
+                else:
+                    loc = f" layup ({n} pts)"
             else:
                 cx, cy = shot.get("court_x"), shot.get("court_y")
-                loc = f" ({cx:.0f},{cy:.0f} ft)" if cx is not None and cy is not None else ""
+                loc = (
+                    f" {distance_from_hoop_ft(float(cx), float(cy)):.0f}' rim"
+                    if cx is not None and cy is not None
+                    else ""
+                )
             st.write(
                 f"**{shot['created_date'].strftime('%H:%M')}** · {sheet}{loc} · **{shot['result']}**"
             )
@@ -2560,7 +2626,7 @@ def _render_active_session(active_sheet: str) -> None:
                 court_map_img,
                 width=COURT_IMG_W,
                 height=COURT_IMG_H,
-                key=f"jump_img_{active_sheet}",
+                key=_jump_court_widget_key(active_sheet),
                 use_column_width="always",
             )
             if picked is not None:
@@ -2593,7 +2659,8 @@ def _render_active_session(active_sheet: str) -> None:
                     st.caption("You haven't placed the marker.")
                 else:
                     px, py = st.session_state.pending_shot
-                    st.caption(f"**({float(px):.1f}, {float(py):.1f}) ft**")
+                    _d_h = distance_from_hoop_ft(float(px), float(py))
+                    st.caption(f"**{_d_h:.1f} ft** from hoop")
                 log_made = st.button(
                     "Made",
                     type="primary",
@@ -2617,7 +2684,8 @@ def _render_active_session(active_sheet: str) -> None:
                 ):
                     st.session_state.pending_shot = None
                     st.session_state.court_inspect_id = None
-                    st.session_state.pop(f"_court_click_{active_sheet}", None)
+                    st.session_state.pop(click_dedup, None)
+                    _bump_jump_court_widget(active_sheet)
                     st.rerun()
 
         if log_made and has_mark:
@@ -2635,7 +2703,8 @@ def _render_active_session(active_sheet: str) -> None:
                 }
             )
             st.session_state.pending_shot = None
-            st.session_state.pop(f"_court_click_{active_sheet}", None)
+            st.session_state.pop(click_dedup, None)
+            _bump_jump_court_widget(active_sheet)
             st.rerun()
         if log_miss and has_mark:
             x, y = st.session_state.pending_shot
@@ -2652,7 +2721,8 @@ def _render_active_session(active_sheet: str) -> None:
                 }
             )
             st.session_state.pending_shot = None
-            st.session_state.pop(f"_court_click_{active_sheet}", None)
+            st.session_state.pop(click_dedup, None)
+            _bump_jump_court_widget(active_sheet)
             st.rerun()
 
     else:
@@ -2758,11 +2828,20 @@ def _render_active_session(active_sheet: str) -> None:
     st.write("##### Recent on this sheet")
     for shot in today_shots[:8]:
         if shot.get("shot_kind") == "layup":
-            loc = f"layup · {len(layup_path_to_pairs(shot.get('layup_path') or []))} pts"
+            pairs = layup_path_to_pairs(shot.get("layup_path") or [])
+            if pairs:
+                lx, ly = pairs[-1]
+                loc = f"layup · {len(pairs)} pts · {distance_from_hoop_ft(lx, ly):.1f}' rim"
+            else:
+                loc = f"layup · 0 pts"
         else:
             cx = shot.get("court_x")
             cy = shot.get("court_y")
-            loc = f" @ ({cx:.1f}, {cy:.1f} ft)" if cx is not None and cy is not None else ""
+            loc = (
+                f" @ {distance_from_hoop_ft(float(cx), float(cy)):.1f}' rim"
+                if cx is not None and cy is not None
+                else ""
+            )
         st.write(
             f"- [{shot['result'].upper()}] {loc} · {shot['created_date'].strftime('%H:%M:%S')}"
         )
