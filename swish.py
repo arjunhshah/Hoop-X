@@ -341,6 +341,16 @@ def build_nba_halfcourt_image(w: int, h: int) -> Image.Image:
     ]
     for i in range(len(pts_rs) - 1):
         dr.line([pts_rs[i], pts_rs[i + 1]], fill="#ffffff", width=2)
+    # Close the restricted zone: diameter on the rim side (through hoop center).
+    fline(
+        dr,
+        hx - RESTRICTED_R_FT,
+        hy,
+        hx + RESTRICTED_R_FT,
+        hy,
+        width=2,
+        fill="#ffffff",
+    )
 
     # Backboard (top view): thick horizontal behind the orange hoop, tangent to the rim on the
     # baseline side; length spans to the restricted semicircle (intersection with radius RESTRICTED_R_FT).
@@ -457,7 +467,7 @@ def build_nba_fullcourt_image(w: int, h: int) -> Image.Image:
 
 
 # Bump to invalidate @st.cache_data on Streamlit Cloud when court graphics change.
-_COURT_BITMAP_CACHE_VERSION = 7
+_COURT_BITMAP_CACHE_VERSION = 8
 
 
 @st.cache_data(show_spinner=False)
