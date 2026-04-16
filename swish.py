@@ -1234,7 +1234,7 @@ def _burst_cam_html(*, interval_ms: int, max_frames: int) -> str:
     const dataUrl = can.toDataURL("image/jpeg", 0.70);
     const ts = Date.now();
     n += 1;
-    stat.textContent = `Capturing… ${n}/${MAX_FRAMES} (${INTERVAL_MS}ms)`;
+    stat.textContent = "Capturing… " + n + "/" + MAX_FRAMES + " (" + INTERVAL_MS + "ms)";
     setValue({{ kind: "burst_frame", n, ts_ms: ts, data_url: dataUrl }});
     if (n >= MAX_FRAMES) {{
       if (timer) clearInterval(timer);
