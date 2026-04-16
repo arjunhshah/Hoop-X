@@ -1184,13 +1184,19 @@ def _burst_cam_html(*, interval_ms: int, max_frames: int) -> str:
   let timer = null;
   let n = 0;
 
+  function send(type, payload) {{
+    window.parent.postMessage(
+      Object.assign({{ isStreamlitMessage: true, type }}, payload || {{}}),
+      "*"
+    );
+  }}
+
+  // Handshake so Streamlit starts accepting messages.
+  send("streamlit:componentReady", {{ apiVersion: 1 }});
+  send("streamlit:setFrameHeight", {{ height: 380 }});
+
   function setValue(obj) {{
-    // Streamlit components HTML message protocol
-    window.parent.postMessage({{
-      isStreamlitMessage: true,
-      type: "streamlit:setComponentValue",
-      value: obj
-    }}, "*");
+    send("streamlit:setComponentValue", {{ value: obj }});
   }}
 
   async function ensureStream() {{
@@ -2913,6 +2919,7 @@ def _render_active_session(active_sheet: str) -> None:
                 key=f"burst_cam_{active_sheet}",
             )
             if isinstance(payload, dict):
+                st.session_state._burst_last_payload = payload.get("kind") or "unknown"
                 kind = payload.get("kind")
                 if kind == "burst_frame" and payload.get("data_url"):
                     frames = list(st.session_state.get("burst_frames") or [])
@@ -2925,6 +2932,10 @@ def _render_active_session(active_sheet: str) -> None:
                     st.session_state.burst_frames = frames[-40:]
                 elif kind == "burst_error":
                     st.warning("Camera error — check iPhone permissions.")
+            elif payload is not None:
+                st.session_state._burst_last_payload = str(type(payload).__name__)
+            if st.session_state.get("_burst_last_payload"):
+                st.caption(f"Burst debug: last event = `{st.session_state._burst_last_payload}`")
             st.write("##### Burst timeline")
             _render_burst_timeline()
             st.write("##### Posture feedback (beta)")
