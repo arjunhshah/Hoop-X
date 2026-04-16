@@ -8,11 +8,12 @@ import json
 import os
 import re
 import base64
+import threading
+import time
 from functools import lru_cache
 from pathlib import Path
 
 import streamlit as st
-import streamlit.components.v1 as components
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from streamlit_image_coordinates import streamlit_image_coordinates
@@ -1152,124 +1153,86 @@ def _bump_jump_court_widget(active_sheet: str) -> None:
     st.session_state[k] = int(st.session_state.get(k, 0)) + 1
 
 
-def _burst_cam_html(*, interval_ms: int, max_frames: int) -> str:
+def _webrtc_burst_panel(active_sheet: str, *, interval_ms: int, max_frames: int) -> None:
+    """Rapid stills from the live camera using WebRTC (works where HTML components cannot return values)."""
+    try:
+        import av  # type: ignore
+        from streamlit_webrtc import WebRtcMode, webrtc_streamer  # type: ignore
+    except Exception:
+        st.warning(
+            "Burst mode needs **`streamlit-webrtc`** + **`av`** installed (see `requirements.txt`). "
+            "Redeploy after dependencies install."
+        )
+        return
+
     interval_ms = int(max(120, min(2000, interval_ms)))
     max_frames = int(max(3, min(60, max_frames)))
-    # IMPORTANT: do not use an f-string here — JS uses `{ ... }` and template literals; Python would
-    # try to interpret them at import time. Inject numbers via placeholders instead.
-    tpl = """
-<div style="font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; color:#e5e5e5;">
-  <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-    <button id="bx_start" style="padding:8px 10px;border-radius:10px;border:1px solid #333;background:#1a1a1a;color:#e5e5e5;cursor:pointer;">Start burst</button>
-    <button id="bx_stop" style="padding:8px 10px;border-radius:10px;border:1px solid #333;background:#111;color:#e5e5e5;cursor:pointer;">Stop</button>
-    <span id="bx_stat" style="color:#9ca3af;font-size:13px;">Idle</span>
-  </div>
-  <div style="margin-top:10px; display:flex; gap:10px; align-items:flex-start; flex-wrap:wrap;">
-    <video id="bx_vid" playsinline autoplay muted style="width: 320px; max-width: 100%; border-radius: 12px; border:1px solid #333; background:#000;"></video>
-    <canvas id="bx_can" width="320" height="240" style="display:none;"></canvas>
-  </div>
-</div>
-<script>
-  const INTERVAL_MS = __INTERVAL_MS__;
-  const MAX_FRAMES = __MAX_FRAMES__;
 
-  const vid = document.getElementById("bx_vid");
-  const can = document.getElementById("bx_can");
-  const ctx = can.getContext("2d");
-  const stat = document.getElementById("bx_stat");
-  const bStart = document.getElementById("bx_start");
-  const bStop = document.getElementById("bx_stop");
+    lock_key = f"_burst_webrtc_lock_{active_sheet}"
+    state_key = f"_burst_webrtc_cap_{active_sheet}"
+    if lock_key not in st.session_state:
+        st.session_state[lock_key] = threading.Lock()
+    if state_key not in st.session_state:
+        st.session_state[state_key] = {
+            "last_ms": 0.0,
+            "n": 0,
+        }
+    cap = st.session_state[state_key]
+    lock = st.session_state[lock_key]
 
-  let stream = null;
-  let timer = null;
-  let n = 0;
+    def _frame_cb(frame: "av.VideoFrame"):
+        now = time.monotonic() * 1000.0
+        with lock:
+            last = float(cap.get("last_ms") or 0.0)
+            n = int(cap.get("n") or 0)
+            if n >= max_frames:
+                return frame
+            if last > 0.0 and (now - last) < float(interval_ms):
+                return frame
+            cap["last_ms"] = now
+            cap["n"] = n + 1
 
-  function send(type, payload) {
-    window.parent.postMessage(
-      Object.assign({ isStreamlitMessage: true, type }, payload || {}),
-      "*"
-    );
-  }
+        try:
+            rgb = frame.to_ndarray(format="rgb24")
+            pil = Image.fromarray(rgb)
+            buf = io.BytesIO()
+            pil.save(buf, format="JPEG", quality=72)
+            b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+            data_url = "data:image/jpeg;base64," + b64
+            frames = list(st.session_state.get("burst_frames") or [])
+            frames.append({"ts_ms": int(time.time() * 1000), "data_url": data_url})
+            st.session_state.burst_frames = frames[-40:]
+        except Exception:
+            pass
+        return frame
 
-  // Handshake so Streamlit starts accepting messages.
-  send("streamlit:componentReady", { apiVersion: 1 });
-  send("streamlit:setFrameHeight", { height: 380 });
-
-  function setValue(obj) {
-    send("streamlit:setComponentValue", { value: obj });
-  }
-
-  async function ensureStream() {
-    if (stream) return stream;
-    stream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        facingMode: "environment",
-        width: { ideal: 640 },
-        height: { ideal: 480 }
-      },
-      audio: false
-    });
-    vid.srcObject = stream;
-    return stream;
-  }
-
-  function stopStream() {
-    try {
-      if (timer) clearInterval(timer);
-      timer = null;
-      if (stream) {
-        stream.getTracks().forEach(t => t.stop());
-      }
-    } catch (e) {}
-    stream = null;
-    vid.srcObject = null;
-    stat.textContent = "Stopped";
-  }
-
-  function captureOnce() {
-    if (!vid.videoWidth || !vid.videoHeight) return;
-    const w = 320, h = Math.round(320 * (vid.videoHeight / vid.videoWidth));
-    can.width = w; can.height = h;
-    ctx.drawImage(vid, 0, 0, w, h);
-    const dataUrl = can.toDataURL("image/jpeg", 0.70);
-    const ts = Date.now();
-    n += 1;
-    stat.textContent = "Capturing… " + n + "/" + MAX_FRAMES + " (" + INTERVAL_MS + "ms)";
-    setValue({ kind: "burst_frame", n: n, ts_ms: ts, data_url: dataUrl });
-    if (n >= MAX_FRAMES) {
-      if (timer) clearInterval(timer);
-      timer = null;
-      stat.textContent = "Done";
+    rtc_configuration = {
+        "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}],
     }
-  }
 
-  bStart.addEventListener("click", async () => {
-    try {
-      await ensureStream();
-      n = 0;
-      stat.textContent = "Starting…";
-      if (timer) clearInterval(timer);
-      timer = setInterval(captureOnce, INTERVAL_MS);
-      captureOnce();
-    } catch (e) {
-      stat.textContent = "Camera error (permission?)";
-      setValue({ kind: "burst_error", message: String(e) });
-    }
-  });
-
-  bStop.addEventListener("click", () => {
-    stopStream();
-    setValue({ kind: "burst_stop", ts_ms: Date.now() });
-  });
-
-  window.addEventListener("beforeunload", stopStream);
-</script>
-"""
-    return (
-        tpl.replace("__INTERVAL_MS__", str(interval_ms)).replace(
-            "__MAX_FRAMES__", str(max_frames)
-        )
+    ctx = webrtc_streamer(
+        key=f"burst_webrtc_{active_sheet}",
+        mode=WebRtcMode.SENDRECV,
+        rtc_configuration=rtc_configuration,
+        media_stream_constraints={
+            "video": {
+                "facingMode": "environment",
+                "width": {"ideal": 640},
+                "height": {"ideal": 480},
+            },
+            "audio": False,
+        },
+        video_frame_callback=_frame_cb,
+        async_processing=True,
     )
+
+    if ctx is not None and getattr(ctx, "state", None) and ctx.state.playing:
+        st.caption(
+            f"Burst running: **{len(st.session_state.get('burst_frames') or [])}** frames buffered "
+            f"(target ~{max_frames} at {interval_ms}ms)."
+        )
+    else:
+        st.caption("Press **START** on the WebRTC widget, allow camera access, then watch the timeline fill.")
 
 
 def _render_burst_timeline() -> None:
@@ -2916,31 +2879,10 @@ def _render_active_session(active_sheet: str) -> None:
 
         if st.session_state.get("player_camera_mode", "still") == "burst":
             st.caption(
-                "Burst captures rapid frames (not video). If you don’t like it, switch back to **Still** and we can remove burst entirely."
+                "Burst uses **WebRTC** to grab rapid stills from your phone camera (not an MP4). "
+                "If you don’t like it, switch back to **Still**."
             )
-            payload = components.html(
-                _burst_cam_html(interval_ms=650, max_frames=18),
-                height=360,
-                key=f"burst_cam_{active_sheet}",
-            )
-            if isinstance(payload, dict):
-                st.session_state._burst_last_payload = payload.get("kind") or "unknown"
-                kind = payload.get("kind")
-                if kind == "burst_frame" and payload.get("data_url"):
-                    frames = list(st.session_state.get("burst_frames") or [])
-                    frames.append(
-                        {
-                            "ts_ms": int(payload.get("ts_ms") or 0),
-                            "data_url": str(payload.get("data_url")),
-                        }
-                    )
-                    st.session_state.burst_frames = frames[-40:]
-                elif kind == "burst_error":
-                    st.warning("Camera error — check iPhone permissions.")
-            elif payload is not None:
-                st.session_state._burst_last_payload = str(type(payload).__name__)
-            if st.session_state.get("_burst_last_payload"):
-                st.caption(f"Burst debug: last event = `{st.session_state._burst_last_payload}`")
+            _webrtc_burst_panel(active_sheet, interval_ms=650, max_frames=18)
             st.write("##### Burst timeline")
             _render_burst_timeline()
             st.write("##### Posture feedback (beta)")
@@ -2976,6 +2918,8 @@ def _render_active_session(active_sheet: str) -> None:
                 use_container_width=True,
             ):
                 st.session_state.burst_frames = []
+                cap_key = f"_burst_webrtc_cap_{active_sheet}"
+                st.session_state[cap_key] = {"last_ms": 0.0, "n": 0}
                 st.rerun()
         else:
             still = st.camera_input(

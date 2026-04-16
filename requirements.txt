@@ -9,3 +9,6 @@ openai>=1.40.0
 # Optional (beta): posture feedback from camera frames
 mediapipe>=0.10.14
 opencv-python-headless>=4.9.0
+# Beta burst camera (live frames; replaces HTML component approach)
+streamlit-webrtc>=0.64.5
+av>=14.0.0
