@@ -6,3 +6,6 @@ Pillow>=10.2.0
 streamlit-image-coordinates>=0.1.6
 matplotlib>=3.8.0
 openai>=1.40.0
+# Optional (beta): posture feedback from camera frames
+mediapipe>=0.10.14
+opencv-python-headless>=4.9.0

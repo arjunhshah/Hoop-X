@@ -7,10 +7,12 @@ import io
 import json
 import os
 import re
+import base64
 from functools import lru_cache
 from pathlib import Path
 
 import streamlit as st
+import streamlit.components.v1 as components
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from streamlit_image_coordinates import streamlit_image_coordinates
@@ -1019,6 +1021,10 @@ def init_state():
     st.session_state.setdefault("_last_shot_mode", None)
     st.session_state.setdefault("court_inspect_id", None)
     st.session_state.setdefault("session_subview", "court")
+    st.session_state.setdefault("player_capture_mode", "manual")  # manual | camera
+    st.session_state.setdefault("player_court_view", "half")  # half | full
+    st.session_state.setdefault("player_camera_mode", "still")  # still | burst
+    st.session_state.setdefault("burst_frames", [])  # list[dict{ts_ms:int, data_url:str}]
     st.session_state.setdefault("coach_chat_by_sheet", {})
     st.session_state.setdefault("home_sheets_expanded", False)
     st.session_state.setdefault("home_dashboard_view", "player")
@@ -1144,6 +1150,250 @@ def _bump_jump_court_widget(active_sheet: str) -> None:
     """Remount the half-court picker so the last click is not replayed on the next run."""
     k = f"_jump_court_rev_{active_sheet}"
     st.session_state[k] = int(st.session_state.get(k, 0)) + 1
+
+
+def _burst_cam_html(*, interval_ms: int, max_frames: int) -> str:
+    interval_ms = int(max(120, min(2000, interval_ms)))
+    max_frames = int(max(3, min(60, max_frames)))
+    # Streamlit "setComponentValue" shim used by components.html
+    # (keeps this self-contained so it can be removed easily if not liked).
+    return f"""
+<div style="font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; color:#e5e5e5;">
+  <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+    <button id="bx_start" style="padding:8px 10px;border-radius:10px;border:1px solid #333;background:#1a1a1a;color:#e5e5e5;cursor:pointer;">Start burst</button>
+    <button id="bx_stop" style="padding:8px 10px;border-radius:10px;border:1px solid #333;background:#111;color:#e5e5e5;cursor:pointer;">Stop</button>
+    <span id="bx_stat" style="color:#9ca3af;font-size:13px;">Idle</span>
+  </div>
+  <div style="margin-top:10px; display:flex; gap:10px; align-items:flex-start; flex-wrap:wrap;">
+    <video id="bx_vid" playsinline autoplay muted style="width: 320px; max-width: 100%; border-radius: 12px; border:1px solid #333; background:#000;"></video>
+    <canvas id="bx_can" width="320" height="240" style="display:none;"></canvas>
+  </div>
+</div>
+<script>
+  const INTERVAL_MS = {interval_ms};
+  const MAX_FRAMES = {max_frames};
+
+  const vid = document.getElementById("bx_vid");
+  const can = document.getElementById("bx_can");
+  const ctx = can.getContext("2d");
+  const stat = document.getElementById("bx_stat");
+  const bStart = document.getElementById("bx_start");
+  const bStop = document.getElementById("bx_stop");
+
+  let stream = null;
+  let timer = null;
+  let n = 0;
+
+  function setValue(obj) {{
+    // Streamlit components HTML message protocol
+    window.parent.postMessage({{
+      isStreamlitMessage: true,
+      type: "streamlit:setComponentValue",
+      value: obj
+    }}, "*");
+  }}
+
+  async function ensureStream() {{
+    if (stream) return stream;
+    stream = await navigator.mediaDevices.getUserMedia({{
+      video: {{
+        facingMode: "environment",
+        width: {{ ideal: 640 }},
+        height: {{ ideal: 480 }}
+      }},
+      audio: false
+    }});
+    vid.srcObject = stream;
+    return stream;
+  }}
+
+  function stopStream() {{
+    try {{
+      if (timer) clearInterval(timer);
+      timer = null;
+      if (stream) {{
+        stream.getTracks().forEach(t => t.stop());
+      }}
+    }} catch (e) {{}}
+    stream = null;
+    vid.srcObject = null;
+    stat.textContent = "Stopped";
+  }}
+
+  function captureOnce() {{
+    if (!vid.videoWidth || !vid.videoHeight) return;
+    const w = 320, h = Math.round(320 * (vid.videoHeight / vid.videoWidth));
+    can.width = w; can.height = h;
+    ctx.drawImage(vid, 0, 0, w, h);
+    const dataUrl = can.toDataURL("image/jpeg", 0.70);
+    const ts = Date.now();
+    n += 1;
+    stat.textContent = `Capturing… ${n}/${MAX_FRAMES} (${INTERVAL_MS}ms)`;
+    setValue({{ kind: "burst_frame", n, ts_ms: ts, data_url: dataUrl }});
+    if (n >= MAX_FRAMES) {{
+      if (timer) clearInterval(timer);
+      timer = null;
+      stat.textContent = "Done";
+    }}
+  }}
+
+  bStart.addEventListener("click", async () => {{
+    try {{
+      await ensureStream();
+      n = 0;
+      stat.textContent = "Starting…";
+      if (timer) clearInterval(timer);
+      timer = setInterval(captureOnce, INTERVAL_MS);
+      captureOnce();
+    }} catch (e) {{
+      stat.textContent = "Camera error (permission?)";
+      setValue({{ kind: "burst_error", message: String(e) }});
+    }}
+  }});
+
+  bStop.addEventListener("click", () => {{
+    stopStream();
+    setValue({{ kind: "burst_stop", ts_ms: Date.now() }});
+  }});
+
+  window.addEventListener("beforeunload", stopStream);
+</script>
+"""
+
+
+def _render_burst_timeline() -> None:
+    frames = st.session_state.get("burst_frames") or []
+    if not frames:
+        st.caption("No burst frames yet.")
+        return
+    cols = st.columns(min(6, len(frames)))
+    tail = frames[-12:]
+    for i, fr in enumerate(tail):
+        with cols[i % len(cols)]:
+            try:
+                st.image(fr["data_url"], use_container_width=True)
+            except Exception:
+                st.caption("Frame unavailable.")
+
+
+def _pil_from_data_url(data_url: str) -> Image.Image | None:
+    try:
+        if not isinstance(data_url, str) or "base64," not in data_url:
+            return None
+        b64 = data_url.split("base64,", 1)[1]
+        raw = base64.b64decode(b64)
+        return Image.open(io.BytesIO(raw)).convert("RGB")
+    except Exception:
+        return None
+
+
+def _pose_landmarks_from_pil(img: Image.Image) -> dict | None:
+    """Return mediapipe pose landmarks as dict{name:(x,y,vis)} in normalized image coords."""
+    try:
+        import cv2  # type: ignore
+        import mediapipe as mp  # type: ignore
+    except Exception:
+        return None
+    try:
+        arr = np.array(img)
+        bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+        with mp.solutions.pose.Pose(
+            static_image_mode=True,
+            model_complexity=1,
+            enable_segmentation=False,
+            min_detection_confidence=0.5,
+        ) as pose:
+            res = pose.process(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+        if not res.pose_landmarks:
+            return None
+        out: dict[str, tuple[float, float, float]] = {}
+        for idx, lm in enumerate(res.pose_landmarks.landmark):
+            out[str(idx)] = (float(lm.x), float(lm.y), float(lm.visibility))
+        return out
+    except Exception:
+        return None
+
+
+def _angle_deg(a, b, c) -> float | None:
+    """Angle ABC in degrees given 2D points."""
+    try:
+        ax, ay = float(a[0]), float(a[1])
+        bx, by = float(b[0]), float(b[1])
+        cx, cy = float(c[0]), float(c[1])
+        v1 = np.array([ax - bx, ay - by], dtype=float)
+        v2 = np.array([cx - bx, cy - by], dtype=float)
+        n1 = float(np.linalg.norm(v1))
+        n2 = float(np.linalg.norm(v2))
+        if n1 < 1e-6 or n2 < 1e-6:
+            return None
+        cosv = float(np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0))
+        return float(np.degrees(np.arccos(cosv)))
+    except Exception:
+        return None
+
+
+def _posture_feedback_from_landmarks(lm: dict) -> list[str]:
+    """
+    Very lightweight heuristics. Uses MediaPipe index mapping:
+    11/12 shoulders, 13/14 elbows, 15/16 wrists, 23/24 hips, 25/26 knees, 27/28 ankles.
+    """
+    def p(i: int):
+        v = lm.get(str(i))
+        return None if v is None else (v[0], v[1], v[2])
+
+    Ls, Rs = p(11), p(12)
+    Le, Re = p(13), p(14)
+    Lw, Rw = p(15), p(16)
+    Lh, Rh = p(23), p(24)
+    Lk, Rk = p(25), p(26)
+    La, Ra = p(27), p(28)
+
+    lines: list[str] = []
+    lines.append("##### Posture feedback (beta)")
+
+    # Pick the more visible side (roughly "shooting side" guess)
+    right_vis = sum((x[2] for x in (Rs, Re, Rw) if x is not None), 0.0)
+    left_vis = sum((x[2] for x in (Ls, Le, Lw) if x is not None), 0.0)
+    side = "right" if right_vis >= left_vis else "left"
+
+    S, E, W = (Rs, Re, Rw) if side == "right" else (Ls, Le, Lw)
+    H, K, A = (Rh, Rk, Ra) if side == "right" else (Lh, Lk, La)
+
+    if S and E and W:
+        ang_elbow = _angle_deg(S, E, W)
+        if ang_elbow is not None:
+            if ang_elbow < 110:
+                lines.append("- **Elbow flex:** looks tight — try a bit more space at set point (don’t collapse).")
+            elif ang_elbow > 170:
+                lines.append("- **Elbow flex:** almost locked — keep a soft bend.")
+            else:
+                lines.append("- **Elbow flex:** good bend through the arm.")
+    else:
+        lines.append("- **Arms:** couldn’t read arm landmarks clearly in this frame.")
+
+    if H and K and A:
+        ang_knee = _angle_deg(H, K, A)
+        if ang_knee is not None:
+            if ang_knee > 170:
+                lines.append("- **Knee bend:** very upright — add a little dip for rhythm/power.")
+            elif ang_knee < 120:
+                lines.append("- **Knee bend:** deep dip — make sure you stay balanced and smooth.")
+            else:
+                lines.append("- **Knee bend:** solid athletic bend.")
+    else:
+        lines.append("- **Lower body:** couldn’t read hip/knee/ankle clearly in this frame.")
+
+    if Ls and Rs and Lh and Rh:
+        # shoulder/hip alignment (rough)
+        sh_y = (Ls[1] + Rs[1]) / 2.0
+        hip_y = (Lh[1] + Rh[1]) / 2.0
+        if hip_y - sh_y < 0.08:
+            lines.append("- **Posture:** torso looks tall — keep ribs stacked over hips.")
+        else:
+            lines.append("- **Posture:** looks reasonably stacked.")
+
+    lines.append("- **Note:** This is a rough single-frame read. Best results come from a clear side view with full body in frame.")
+    return lines
 
 
 def _render_home_sheet_cell(sheet: str, idx: int, shots_today_list: list) -> None:
@@ -2568,12 +2818,174 @@ def _render_active_session(active_sheet: str) -> None:
     all_shots = base44.list_shots()
     st.subheader(f"Session · {active_sheet}")
 
+    # Top toggles (mobile-friendly): manual vs camera; half vs full court.
+    t1, t2, t3, t4 = st.columns([1, 1, 1, 1])
+    cap = st.session_state.get("player_capture_mode", "manual")
+    view = st.session_state.get("player_court_view", "half")
+    with t1:
+        if st.button(
+            "Manual",
+            key=f"cap_manual_{active_sheet}",
+            type="primary" if cap == "manual" else "secondary",
+            use_container_width=True,
+            disabled=cap == "manual",
+        ):
+            st.session_state.player_capture_mode = "manual"
+            st.rerun()
+    with t2:
+        if st.button(
+            "Camera (beta)",
+            key=f"cap_camera_{active_sheet}",
+            type="primary" if cap == "camera" else "secondary",
+            use_container_width=True,
+            disabled=cap == "camera",
+        ):
+            st.session_state.player_capture_mode = "camera"
+            st.rerun()
+    with t3:
+        if st.button(
+            "Half court",
+            key=f"view_half_{active_sheet}",
+            type="primary" if view == "half" else "secondary",
+            use_container_width=True,
+            disabled=view == "half",
+        ):
+            st.session_state.player_court_view = "half"
+            st.rerun()
+    with t4:
+        if st.button(
+            "Full court (beta)",
+            key=f"view_full_{active_sheet}",
+            type="primary" if view == "full" else "secondary",
+            use_container_width=True,
+            disabled=view == "full",
+        ):
+            st.session_state.player_court_view = "full"
+            st.rerun()
+
+    if st.session_state.get("player_court_view", "half") == "full":
+        st.info(
+            "**Full court (beta):** UI toggle is ready, but shot plotting/logging is still half-court for now."
+        )
+
     today_shots = [
         s
         for s in all_shots
         if s["created_date"].date().isoformat() == today_iso()
         and s.get("session_name") == active_sheet
     ]
+
+    if st.session_state.get("player_capture_mode", "manual") == "camera":
+        st.caption(
+            "**Phone camera (beta):** capture a clip/photo for your records, then still **tap the court** to mark the spot and log made/miss. "
+            "Automatic ball tracking + auto make/miss needs a dedicated CV pipeline and is not enabled yet."
+        )
+        cm = st.session_state.get("player_camera_mode", "still")
+        m1, m2 = st.columns([1, 1])
+        with m1:
+            if st.button(
+                "Still",
+                key=f"cam_still_{active_sheet}",
+                type="primary" if cm == "still" else "secondary",
+                use_container_width=True,
+                disabled=cm == "still",
+            ):
+                st.session_state.player_camera_mode = "still"
+                st.rerun()
+        with m2:
+            if st.button(
+                "Burst (beta)",
+                key=f"cam_burst_{active_sheet}",
+                type="primary" if cm == "burst" else "secondary",
+                use_container_width=True,
+                disabled=cm == "burst",
+            ):
+                st.session_state.player_camera_mode = "burst"
+                st.rerun()
+
+        if st.session_state.get("player_camera_mode", "still") == "burst":
+            st.caption(
+                "Burst captures rapid frames (not video). If you don’t like it, switch back to **Still** and we can remove burst entirely."
+            )
+            payload = components.html(
+                _burst_cam_html(interval_ms=650, max_frames=18),
+                height=360,
+                key=f"burst_cam_{active_sheet}",
+            )
+            if isinstance(payload, dict):
+                kind = payload.get("kind")
+                if kind == "burst_frame" and payload.get("data_url"):
+                    frames = list(st.session_state.get("burst_frames") or [])
+                    frames.append(
+                        {
+                            "ts_ms": int(payload.get("ts_ms") or 0),
+                            "data_url": str(payload.get("data_url")),
+                        }
+                    )
+                    st.session_state.burst_frames = frames[-40:]
+                elif kind == "burst_error":
+                    st.warning("Camera error — check iPhone permissions.")
+            st.write("##### Burst timeline")
+            _render_burst_timeline()
+            st.write("##### Posture feedback (beta)")
+            frames = st.session_state.get("burst_frames") or []
+            if not frames:
+                st.caption("Capture a burst first, then pick a frame to analyze.")
+            else:
+                idx = st.selectbox(
+                    "Frame",
+                    options=list(range(len(frames))),
+                    index=len(frames) - 1,
+                    format_func=lambda i: f"Frame {i+1} (t={int(frames[i].get('ts_ms') or 0)})",
+                    key=f"burst_pick_{active_sheet}",
+                )
+                fr = frames[int(idx)]
+                img = _pil_from_data_url(str(fr.get("data_url") or ""))
+                if img is None:
+                    st.caption("Couldn’t decode this frame.")
+                else:
+                    lm = _pose_landmarks_from_pil(img)
+                    if lm is None:
+                        st.caption(
+                            "Pose model unavailable or no person detected. "
+                            "If this is Streamlit Cloud, make sure `mediapipe` installed, and try a clearer side view."
+                        )
+                    else:
+                        for line in _posture_feedback_from_landmarks(lm):
+                            st.markdown(line)
+            if st.button(
+                "Clear burst frames",
+                key=f"burst_clear_{active_sheet}",
+                type="secondary",
+                use_container_width=True,
+            ):
+                st.session_state.burst_frames = []
+                st.rerun()
+        else:
+            still = st.camera_input(
+                "Capture (optional)",
+                key=f"camera_cap_{active_sheet}",
+            )
+            st.write("##### Posture feedback (beta)")
+            if still is None:
+                st.caption("Take a photo above to get posture feedback.")
+            else:
+                try:
+                    img = Image.open(io.BytesIO(still.getvalue())).convert("RGB")
+                except Exception:
+                    img = None
+                if img is None:
+                    st.caption("Couldn’t read the captured image.")
+                else:
+                    lm = _pose_landmarks_from_pil(img)
+                    if lm is None:
+                        st.caption(
+                            "Pose model unavailable or no person detected. "
+                            "Try a clearer side view with full body visible."
+                        )
+                    else:
+                        for line in _posture_feedback_from_landmarks(lm):
+                            st.markdown(line)
 
     shot_mode = st.radio(
         "Shot type",
