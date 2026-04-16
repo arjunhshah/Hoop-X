@@ -1155,9 +1155,9 @@ def _bump_jump_court_widget(active_sheet: str) -> None:
 def _burst_cam_html(*, interval_ms: int, max_frames: int) -> str:
     interval_ms = int(max(120, min(2000, interval_ms)))
     max_frames = int(max(3, min(60, max_frames)))
-    # Streamlit "setComponentValue" shim used by components.html
-    # (keeps this self-contained so it can be removed easily if not liked).
-    return f"""
+    # IMPORTANT: do not use an f-string here — JS uses `{ ... }` and template literals; Python would
+    # try to interpret them at import time. Inject numbers via placeholders instead.
+    tpl = """
 <div style="font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; color:#e5e5e5;">
   <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
     <button id="bx_start" style="padding:8px 10px;border-radius:10px;border:1px solid #333;background:#1a1a1a;color:#e5e5e5;cursor:pointer;">Start burst</button>
@@ -1170,8 +1170,8 @@ def _burst_cam_html(*, interval_ms: int, max_frames: int) -> str:
   </div>
 </div>
 <script>
-  const INTERVAL_MS = {interval_ms};
-  const MAX_FRAMES = {max_frames};
+  const INTERVAL_MS = __INTERVAL_MS__;
+  const MAX_FRAMES = __MAX_FRAMES__;
 
   const vid = document.getElementById("bx_vid");
   const can = document.getElementById("bx_can");
@@ -1184,49 +1184,49 @@ def _burst_cam_html(*, interval_ms: int, max_frames: int) -> str:
   let timer = null;
   let n = 0;
 
-  function send(type, payload) {{
+  function send(type, payload) {
     window.parent.postMessage(
-      Object.assign({{ isStreamlitMessage: true, type }}, payload || {{}}),
+      Object.assign({ isStreamlitMessage: true, type }, payload || {}),
       "*"
     );
-  }}
+  }
 
   // Handshake so Streamlit starts accepting messages.
-  send("streamlit:componentReady", {{ apiVersion: 1 }});
-  send("streamlit:setFrameHeight", {{ height: 380 }});
+  send("streamlit:componentReady", { apiVersion: 1 });
+  send("streamlit:setFrameHeight", { height: 380 });
 
-  function setValue(obj) {{
-    send("streamlit:setComponentValue", {{ value: obj }});
-  }}
+  function setValue(obj) {
+    send("streamlit:setComponentValue", { value: obj });
+  }
 
-  async function ensureStream() {{
+  async function ensureStream() {
     if (stream) return stream;
-    stream = await navigator.mediaDevices.getUserMedia({{
-      video: {{
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: {
         facingMode: "environment",
-        width: {{ ideal: 640 }},
-        height: {{ ideal: 480 }}
-      }},
+        width: { ideal: 640 },
+        height: { ideal: 480 }
+      },
       audio: false
-    }});
+    });
     vid.srcObject = stream;
     return stream;
-  }}
+  }
 
-  function stopStream() {{
-    try {{
+  function stopStream() {
+    try {
       if (timer) clearInterval(timer);
       timer = null;
-      if (stream) {{
+      if (stream) {
         stream.getTracks().forEach(t => t.stop());
-      }}
-    }} catch (e) {{}}
+      }
+    } catch (e) {}
     stream = null;
     vid.srcObject = null;
     stat.textContent = "Stopped";
-  }}
+  }
 
-  function captureOnce() {{
+  function captureOnce() {
     if (!vid.videoWidth || !vid.videoHeight) return;
     const w = 320, h = Math.round(320 * (vid.videoHeight / vid.videoWidth));
     can.width = w; can.height = h;
@@ -1235,36 +1235,41 @@ def _burst_cam_html(*, interval_ms: int, max_frames: int) -> str:
     const ts = Date.now();
     n += 1;
     stat.textContent = "Capturing… " + n + "/" + MAX_FRAMES + " (" + INTERVAL_MS + "ms)";
-    setValue({{ kind: "burst_frame", n, ts_ms: ts, data_url: dataUrl }});
-    if (n >= MAX_FRAMES) {{
+    setValue({ kind: "burst_frame", n: n, ts_ms: ts, data_url: dataUrl });
+    if (n >= MAX_FRAMES) {
       if (timer) clearInterval(timer);
       timer = null;
       stat.textContent = "Done";
-    }}
-  }}
+    }
+  }
 
-  bStart.addEventListener("click", async () => {{
-    try {{
+  bStart.addEventListener("click", async () => {
+    try {
       await ensureStream();
       n = 0;
       stat.textContent = "Starting…";
       if (timer) clearInterval(timer);
       timer = setInterval(captureOnce, INTERVAL_MS);
       captureOnce();
-    }} catch (e) {{
+    } catch (e) {
       stat.textContent = "Camera error (permission?)";
-      setValue({{ kind: "burst_error", message: String(e) }});
-    }}
-  }});
+      setValue({ kind: "burst_error", message: String(e) });
+    }
+  });
 
-  bStop.addEventListener("click", () => {{
+  bStop.addEventListener("click", () => {
     stopStream();
-    setValue({{ kind: "burst_stop", ts_ms: Date.now() }});
-  }});
+    setValue({ kind: "burst_stop", ts_ms: Date.now() });
+  });
 
   window.addEventListener("beforeunload", stopStream);
 </script>
 """
+    return (
+        tpl.replace("__INTERVAL_MS__", str(interval_ms)).replace(
+            "__MAX_FRAMES__", str(max_frames)
+        )
+    )
 
 
 def _render_burst_timeline() -> None:
