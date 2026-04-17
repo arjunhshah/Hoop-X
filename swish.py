@@ -1153,65 +1153,102 @@ def _bump_jump_court_widget(active_sheet: str) -> None:
     st.session_state[k] = int(st.session_state.get(k, 0)) + 1
 
 
-_burst_pose_lock = threading.Lock()
-_burst_pose = None  # lazy MediaPipe Pose for burst callback (serialized by lock)
+_burst_hands_lock = threading.Lock()
+_burst_hands = None  # lazy MediaPipe Hands for burst WebRTC callback (serialized by lock)
 
 
-def _hand_plane_distance_m_from_pose_result(res) -> float | None:
-    """
-    Uncalibrated test: distance from the more-visible wrist to the vertical plane through
-    the shoulder line. Proxy for “hand vs torso / back-wall” reach, not a real wall range
-    without calibration. Uses pose_world_landmarks (approx. meters).
-    """
+def _pick_largest_hand_landmarks(multi) -> object | None:
+    """Prefer the hand with the largest 2D bbox in normalized image coords."""
     try:
-        if res is None or not res.pose_world_landmarks or not res.pose_landmarks:
-            return None
-        wl = res.pose_world_landmarks.landmark
-        pl = res.pose_landmarks.landmark
-
-        def W(i: int) -> np.ndarray:
-            m = wl[i]
-            return np.array([float(m.x), float(m.y), float(m.z)], dtype=float)
-
-        ls, rs = W(11), W(12)
-        mid = (ls + rs) * 0.5
-        u = rs - ls
-        up = np.array([0.0, 1.0, 0.0], dtype=float)
-        n = np.cross(u, up)
-        nn = float(np.linalg.norm(n))
-        if nn < 1e-6:
-            return None
-        n = n / nn
-        vis_l = float(pl[15].visibility)
-        vis_r = float(pl[16].visibility)
-        wrist = W(16) if vis_r >= vis_l else W(15)
-        return abs(float(np.dot(wrist - mid, n)))
+        best = None
+        best_area = -1.0
+        for h in multi:
+            xs = [float(p.x) for p in h.landmark]
+            ys = [float(p.y) for p in h.landmark]
+            w = max(xs) - min(xs)
+            hb = max(ys) - min(ys)
+            area = w * hb
+            if area > best_area:
+                best_area = area
+                best = h
+        return best
     except Exception:
         return None
 
 
-def _hand_to_torso_plane_m_from_rgb(rgb: np.ndarray) -> float | None:
-    """Streaming pose on live RGB (burst WebRTC). See _hand_plane_distance_m_from_pose_result."""
-    global _burst_pose
+def _hand_wall_proxy_from_hands_results(results) -> float | None:
+    """
+    Hand-only proxy for “how far the hand sits toward the background / wall” from a single
+    RGB view. Uses MediaPipe Hand z (depth vs wrist) + fingertip extension—unitless. Not real
+    meters to a wall without calibration or depth hardware.
+    """
+    try:
+        if results is None or not results.multi_hand_landmarks:
+            return None
+        hand = _pick_largest_hand_landmarks(results.multi_hand_landmarks)
+        if hand is None:
+            return None
+        lm = hand.landmark
+        zs = [float(lm[i].z) for i in range(21)]
+        wrist_z = float(lm[0].z)
+        z_max = max(zs)
+        z_min = min(zs)
+        tips = (4, 8, 12, 16, 20)
+        tip_mean_z = sum(float(lm[i].z) for i in tips) / float(len(tips))
+        extent = max(0.0, tip_mean_z - wrist_z) + (z_max - z_min) * 0.35
+        if extent <= 1e-9:
+            return None
+        return float(extent)
+    except Exception:
+        return None
+
+
+def _hand_wall_proxy_from_rgb_streaming(rgb: np.ndarray) -> float | None:
+    """Live frames (burst): reusable Hands instance."""
+    global _burst_hands
     try:
         import mediapipe as mp  # type: ignore
     except Exception:
         return None
     try:
-        with _burst_pose_lock:
-            if _burst_pose is None:
-                _burst_pose = mp.solutions.pose.Pose(
+        with _burst_hands_lock:
+            if _burst_hands is None:
+                _burst_hands = mp.solutions.hands.Hands(
                     static_image_mode=False,
+                    max_num_hands=2,
                     model_complexity=1,
-                    enable_segmentation=False,
-                    smooth_landmarks=True,
-                    min_detection_confidence=0.5,
-                    min_tracking_confidence=0.5,
+                    min_detection_confidence=0.25,
+                    min_tracking_confidence=0.25,
                 )
-            res = _burst_pose.process(rgb)
-        return _hand_plane_distance_m_from_pose_result(res)
+            res = _burst_hands.process(rgb)
+        return _hand_wall_proxy_from_hands_results(res)
     except Exception:
         return None
+
+
+def _hand_wall_proxy_from_rgb_static(rgb: np.ndarray) -> float | None:
+    """Single photo (still): one-shot Hands."""
+    try:
+        import mediapipe as mp  # type: ignore
+    except Exception:
+        return None
+    try:
+        with mp.solutions.hands.Hands(
+            static_image_mode=True,
+            max_num_hands=2,
+            model_complexity=1,
+            min_detection_confidence=0.25,
+            min_tracking_confidence=0.25,
+        ) as hands:
+            res = hands.process(rgb)
+        return _hand_wall_proxy_from_hands_results(res)
+    except Exception:
+        return None
+
+
+def _hand_wall_proxy_display_cm(raw: float) -> float:
+    """Map unitless hand depth proxy to a display number (not true centimeters)."""
+    return float(raw) * 55.0
 
 
 def _webrtc_burst_panel(active_sheet: str, *, interval_ms: int, max_frames: int) -> None:
@@ -1241,7 +1278,7 @@ def _webrtc_burst_panel(active_sheet: str, *, interval_ms: int, max_frames: int)
         }
     cap = st.session_state[state_key]
     lock = st.session_state[lock_key]
-    depth_key = f"_burst_hand_plane_m_{active_sheet}"
+    depth_key = f"_burst_hand_wall_proxy_{active_sheet}"
     depth_interval_ms = 120.0
 
     def _frame_cb(frame: "av.VideoFrame"):
@@ -1254,9 +1291,9 @@ def _webrtc_burst_panel(active_sheet: str, *, interval_ms: int, max_frames: int)
         with lock:
             last_d = float(cap.get("last_depth_ms") or 0.0)
         if last_d <= 0.0 or (now - last_d) >= depth_interval_ms:
-            d_m = _hand_to_torso_plane_m_from_rgb(rgb)
-            if d_m is not None:
-                st.session_state[depth_key] = float(d_m)
+            d_raw = _hand_wall_proxy_from_rgb_streaming(rgb)
+            if d_raw is not None:
+                st.session_state[depth_key] = float(d_raw)
             with lock:
                 cap["last_depth_ms"] = now
 
@@ -1311,7 +1348,7 @@ def _webrtc_burst_panel(active_sheet: str, *, interval_ms: int, max_frames: int)
         )
     else:
         st.caption(
-            "Starting camera… allow access if the browser asks. Stills and the hand metric update once frames arrive."
+            "Starting camera… allow access if the browser asks. Stills and the hand-only wall proxy update once frames arrive."
         )
 
 
@@ -1341,18 +1378,13 @@ def _pil_from_data_url(data_url: str) -> Image.Image | None:
         return None
 
 
-def _pose_landmarks_and_hand_plane_from_pil(
-    img: Image.Image,
-) -> tuple[dict | None, float | None]:
-    """
-    Single static pose pass: 2D landmarks for posture UI plus hand–torso plane distance (m)
-    when world landmarks exist.
-    """
+def _pose_landmarks_from_pil(img: Image.Image) -> dict | None:
+    """Return mediapipe pose landmarks as dict{name:(x,y,vis)} in normalized image coords."""
     try:
         import cv2  # type: ignore
         import mediapipe as mp  # type: ignore
     except Exception:
-        return None, None
+        return None
     try:
         arr = np.array(img)
         bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
@@ -1364,19 +1396,13 @@ def _pose_landmarks_and_hand_plane_from_pil(
         ) as pose:
             res = pose.process(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
         if not res.pose_landmarks:
-            return None, _hand_plane_distance_m_from_pose_result(res)
+            return None
         out: dict[str, tuple[float, float, float]] = {}
         for idx, lm in enumerate(res.pose_landmarks.landmark):
             out[str(idx)] = (float(lm.x), float(lm.y), float(lm.visibility))
-        return out, _hand_plane_distance_m_from_pose_result(res)
+        return out
     except Exception:
-        return None, None
-
-
-def _pose_landmarks_from_pil(img: Image.Image) -> dict | None:
-    """Return mediapipe pose landmarks as dict{name:(x,y,vis)} in normalized image coords."""
-    lm, _ = _pose_landmarks_and_hand_plane_from_pil(img)
-    return lm
+        return None
 
 
 def _angle_deg(a, b, c) -> float | None:
@@ -3011,23 +3037,22 @@ def _render_active_session(active_sheet: str) -> None:
                 st.session_state.burst_frames = []
                 cap_key = f"_burst_webrtc_cap_{active_sheet}"
                 st.session_state[cap_key] = {"last_ms": 0.0, "n": 0, "last_depth_ms": 0.0}
-                st.session_state.pop(f"_burst_hand_plane_m_{active_sheet}", None)
+                st.session_state.pop(f"_burst_hand_wall_proxy_{active_sheet}", None)
                 st.rerun()
             st.write("##### Live distance (test)")
-            d_m = st.session_state.get(f"_burst_hand_plane_m_{active_sheet}")
-            if isinstance(d_m, (int, float)) and float(d_m) > 0.0:
+            d_raw = st.session_state.get(f"_burst_hand_wall_proxy_{active_sheet}")
+            if isinstance(d_raw, (int, float)) and float(d_raw) > 0.0:
                 st.metric(
-                    "Hand ↔ torso plane",
-                    f"{float(d_m) * 100.0:.1f} cm",
-                    help="Uncalibrated MediaPipe estimate: distance from your more-visible wrist to the vertical plane through your shoulders. "
-                    "Rough stand-in for reach toward/away from the camera—not true distance to a physical wall without calibration.",
+                    "Hand → wall behind (proxy)",
+                    f"{_hand_wall_proxy_display_cm(float(d_raw)):.1f} cm*",
+                    help="Hand-only MediaPipe depth (landmark z). Scaled for readability—the asterisk means not true centimeters to your wall without calibration.",
                 )
                 st.caption(
-                    "For a real “distance to the wall behind you” you’d need calibration (known wall plane or reference size). "
-                    "This number is only a live tracking test."
+                    "**Hand in frame only**—full body not required. "
+                    "*Scaled proxy, not real distance to the wall; for that you’d need calibration or a depth camera."
                 )
             else:
-                st.caption("Distance appears here once pose is detected in the live stream (full body helps).")
+                st.caption("Hold a hand in view; the proxy appears when MediaPipe detects it (good lighting helps).")
         else:
             still = st.camera_input(
                 "Capture (optional)",
@@ -3044,7 +3069,7 @@ def _render_active_session(active_sheet: str) -> None:
                 if img is None:
                     st.caption("Couldn’t read the captured image.")
                 else:
-                    lm, d_still = _pose_landmarks_and_hand_plane_from_pil(img)
+                    lm = _pose_landmarks_from_pil(img)
                     if lm is None:
                         st.caption(
                             "Pose model unavailable or no person detected. "
@@ -3054,20 +3079,21 @@ def _render_active_session(active_sheet: str) -> None:
                         for line in _posture_feedback_from_landmarks(lm):
                             st.markdown(line)
                     st.write("##### Distance test (still)")
+                    d_still = _hand_wall_proxy_from_rgb_static(np.array(img))
                     if isinstance(d_still, (int, float)) and float(d_still) > 0.0:
                         st.metric(
-                            "Hand ↔ torso plane (wall proxy)",
-                            f"{float(d_still) * 100.0:.1f} cm",
-                            help="Uncalibrated MediaPipe estimate: wrist vs vertical plane through your shoulders. "
-                            "Not true distance to a wall without calibration.",
+                            "Hand → wall behind (proxy)",
+                            f"{_hand_wall_proxy_display_cm(float(d_still)):.1f} cm*",
+                            help="Hand-only MediaPipe depth (landmark z). Scaled for readability—not true centimeters to your wall.",
                         )
                         st.caption(
-                            "Test only: treating the shoulder plane as a rough stand-in for “behind you.” "
-                            "Real back-wall distance needs a calibrated scene."
+                            "**Hand in frame only** for this number—posture above still needs your body in frame. "
+                            "*Scaled proxy, not real wall distance without calibration."
                         )
                     else:
                         st.caption(
-                            "Distance needs a detected pose with full body visible (same as posture above)."
+                            "Show your hand clearly for the wall proxy (lighting and contrast help). "
+                            "Posture feedback above is separate and needs full body."
                         )
 
     shot_mode = st.radio(
