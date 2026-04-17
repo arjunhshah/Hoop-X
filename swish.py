@@ -2956,20 +2956,6 @@ def _render_active_session(active_sheet: str) -> None:
                 "Switch back to **Still** for a single snapshot."
             )
             _webrtc_burst_panel(active_sheet, interval_ms=650, max_frames=18)
-            d_m = st.session_state.get(f"_burst_hand_plane_m_{active_sheet}")
-            if isinstance(d_m, (int, float)) and float(d_m) > 0.0:
-                st.metric(
-                    "Test: hand ↔ torso plane",
-                    f"{float(d_m) * 100.0:.1f} cm",
-                    help="Uncalibrated MediaPipe estimate: distance from your more-visible wrist to the vertical plane through your shoulders. "
-                    "Rough stand-in for reach toward/away from the camera—not true distance to a physical wall without calibration.",
-                )
-                st.caption(
-                    "For a real “distance to the wall behind you” you’d need calibration (known wall plane or reference size). "
-                    "This number is only a live tracking test."
-                )
-            else:
-                st.caption("Hand metric appears once pose is detected in the live stream (full body helps).")
             st.write("##### Burst timeline")
             _render_burst_timeline()
             st.write("##### Posture feedback (beta)")
@@ -3009,6 +2995,21 @@ def _render_active_session(active_sheet: str) -> None:
                 st.session_state[cap_key] = {"last_ms": 0.0, "n": 0, "last_depth_ms": 0.0}
                 st.session_state.pop(f"_burst_hand_plane_m_{active_sheet}", None)
                 st.rerun()
+            st.write("##### Live distance (test)")
+            d_m = st.session_state.get(f"_burst_hand_plane_m_{active_sheet}")
+            if isinstance(d_m, (int, float)) and float(d_m) > 0.0:
+                st.metric(
+                    "Hand ↔ torso plane",
+                    f"{float(d_m) * 100.0:.1f} cm",
+                    help="Uncalibrated MediaPipe estimate: distance from your more-visible wrist to the vertical plane through your shoulders. "
+                    "Rough stand-in for reach toward/away from the camera—not true distance to a physical wall without calibration.",
+                )
+                st.caption(
+                    "For a real “distance to the wall behind you” you’d need calibration (known wall plane or reference size). "
+                    "This number is only a live tracking test."
+                )
+            else:
+                st.caption("Distance appears here once pose is detected in the live stream (full body helps).")
         else:
             still = st.camera_input(
                 "Capture (optional)",
