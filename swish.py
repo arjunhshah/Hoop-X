@@ -1153,6 +1153,60 @@ def _bump_jump_court_widget(active_sheet: str) -> None:
     st.session_state[k] = int(st.session_state.get(k, 0)) + 1
 
 
+_burst_pose_lock = threading.Lock()
+_burst_pose = None  # lazy MediaPipe Pose for burst callback (serialized by lock)
+
+
+def _hand_to_torso_plane_m_from_rgb(rgb: np.ndarray) -> float | None:
+    """
+    Uncalibrated test metric: perpendicular distance from the more-visible wrist to the
+    vertical plane through the shoulder line (midpoint = between shoulders). This is a rough
+    proxy for “how far the hand sits in front of the torso,” not literal distance to a wall.
+    Uses MediaPipe pose_world_landmarks (approx. meters).
+    """
+    global _burst_pose
+    try:
+        import mediapipe as mp  # type: ignore
+    except Exception:
+        return None
+    try:
+        with _burst_pose_lock:
+            if _burst_pose is None:
+                _burst_pose = mp.solutions.pose.Pose(
+                    static_image_mode=False,
+                    model_complexity=1,
+                    enable_segmentation=False,
+                    smooth_landmarks=True,
+                    min_detection_confidence=0.5,
+                    min_tracking_confidence=0.5,
+                )
+            res = _burst_pose.process(rgb)
+        if not res.pose_world_landmarks or not res.pose_landmarks:
+            return None
+        wl = res.pose_world_landmarks.landmark
+        pl = res.pose_landmarks.landmark
+
+        def W(i: int) -> np.ndarray:
+            m = wl[i]
+            return np.array([float(m.x), float(m.y), float(m.z)], dtype=float)
+
+        ls, rs = W(11), W(12)
+        mid = (ls + rs) * 0.5
+        u = rs - ls
+        up = np.array([0.0, 1.0, 0.0], dtype=float)
+        n = np.cross(u, up)
+        nn = float(np.linalg.norm(n))
+        if nn < 1e-6:
+            return None
+        n = n / nn
+        vis_l = float(pl[15].visibility)
+        vis_r = float(pl[16].visibility)
+        wrist = W(16) if vis_r >= vis_l else W(15)
+        return abs(float(np.dot(wrist - mid, n)))
+    except Exception:
+        return None
+
+
 def _webrtc_burst_panel(active_sheet: str, *, interval_ms: int, max_frames: int) -> None:
     """Rapid stills from the live camera using WebRTC (works where HTML components cannot return values)."""
     try:
@@ -1176,24 +1230,40 @@ def _webrtc_burst_panel(active_sheet: str, *, interval_ms: int, max_frames: int)
         st.session_state[state_key] = {
             "last_ms": 0.0,
             "n": 0,
+            "last_depth_ms": 0.0,
         }
     cap = st.session_state[state_key]
     lock = st.session_state[lock_key]
+    depth_key = f"_burst_hand_plane_m_{active_sheet}"
+    depth_interval_ms = 120.0
 
     def _frame_cb(frame: "av.VideoFrame"):
         now = time.monotonic() * 1000.0
+        try:
+            rgb = frame.to_ndarray(format="rgb24")
+        except Exception:
+            return frame
+
         with lock:
-            last = float(cap.get("last_ms") or 0.0)
+            last_d = float(cap.get("last_depth_ms") or 0.0)
+        if last_d <= 0.0 or (now - last_d) >= depth_interval_ms:
+            d_m = _hand_to_torso_plane_m_from_rgb(rgb)
+            if d_m is not None:
+                st.session_state[depth_key] = float(d_m)
+            with lock:
+                cap["last_depth_ms"] = now
+
+        with lock:
             n = int(cap.get("n") or 0)
             if n >= max_frames:
                 return frame
+            last = float(cap.get("last_ms") or 0.0)
             if last > 0.0 and (now - last) < float(interval_ms):
                 return frame
             cap["last_ms"] = now
             cap["n"] = n + 1
 
         try:
-            rgb = frame.to_ndarray(format="rgb24")
             pil = Image.fromarray(rgb)
             buf = io.BytesIO()
             pil.save(buf, format="JPEG", quality=72)
@@ -1213,6 +1283,7 @@ def _webrtc_burst_panel(active_sheet: str, *, interval_ms: int, max_frames: int)
     ctx = webrtc_streamer(
         key=f"burst_webrtc_{active_sheet}",
         mode=WebRtcMode.SENDRECV,
+        desired_playing_state=True,
         rtc_configuration=rtc_configuration,
         media_stream_constraints={
             "video": {
@@ -1228,11 +1299,13 @@ def _webrtc_burst_panel(active_sheet: str, *, interval_ms: int, max_frames: int)
 
     if ctx is not None and getattr(ctx, "state", None) and ctx.state.playing:
         st.caption(
-            f"Burst running: **{len(st.session_state.get('burst_frames') or [])}** frames buffered "
-            f"(target ~{max_frames} at {interval_ms}ms)."
+            f"Live capture: **{len(st.session_state.get('burst_frames') or [])}** stills buffered "
+            f"(up to ~{max_frames} at {interval_ms}ms). Allow camera if prompted."
         )
     else:
-        st.caption("Press **START** on the WebRTC widget, allow camera access, then watch the timeline fill.")
+        st.caption(
+            "Starting camera… allow access if the browser asks. Stills and the hand metric update once frames arrive."
+        )
 
 
 def _render_burst_timeline() -> None:
@@ -2879,10 +2952,24 @@ def _render_active_session(active_sheet: str) -> None:
 
         if st.session_state.get("player_camera_mode", "still") == "burst":
             st.caption(
-                "Burst uses **WebRTC** to grab rapid stills from your phone camera (not an MP4). "
-                "If you don’t like it, switch back to **Still**."
+                "**Burst** opens the camera immediately and samples rapid **stills** (not a saved video). "
+                "Switch back to **Still** for a single snapshot."
             )
             _webrtc_burst_panel(active_sheet, interval_ms=650, max_frames=18)
+            d_m = st.session_state.get(f"_burst_hand_plane_m_{active_sheet}")
+            if isinstance(d_m, (int, float)) and float(d_m) > 0.0:
+                st.metric(
+                    "Test: hand ↔ torso plane",
+                    f"{float(d_m) * 100.0:.1f} cm",
+                    help="Uncalibrated MediaPipe estimate: distance from your more-visible wrist to the vertical plane through your shoulders. "
+                    "Rough stand-in for reach toward/away from the camera—not true distance to a physical wall without calibration.",
+                )
+                st.caption(
+                    "For a real “distance to the wall behind you” you’d need calibration (known wall plane or reference size). "
+                    "This number is only a live tracking test."
+                )
+            else:
+                st.caption("Hand metric appears once pose is detected in the live stream (full body helps).")
             st.write("##### Burst timeline")
             _render_burst_timeline()
             st.write("##### Posture feedback (beta)")
@@ -2919,7 +3006,8 @@ def _render_active_session(active_sheet: str) -> None:
             ):
                 st.session_state.burst_frames = []
                 cap_key = f"_burst_webrtc_cap_{active_sheet}"
-                st.session_state[cap_key] = {"last_ms": 0.0, "n": 0}
+                st.session_state[cap_key] = {"last_ms": 0.0, "n": 0, "last_depth_ms": 0.0}
+                st.session_state.pop(f"_burst_hand_plane_m_{active_sheet}", None)
                 st.rerun()
         else:
             still = st.camera_input(
