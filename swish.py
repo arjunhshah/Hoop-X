@@ -1157,31 +1157,14 @@ _burst_pose_lock = threading.Lock()
 _burst_pose = None  # lazy MediaPipe Pose for burst callback (serialized by lock)
 
 
-def _hand_to_torso_plane_m_from_rgb(rgb: np.ndarray) -> float | None:
+def _hand_plane_distance_m_from_pose_result(res) -> float | None:
     """
-    Uncalibrated test metric: perpendicular distance from the more-visible wrist to the
-    vertical plane through the shoulder line (midpoint = between shoulders). This is a rough
-    proxy for “how far the hand sits in front of the torso,” not literal distance to a wall.
-    Uses MediaPipe pose_world_landmarks (approx. meters).
+    Uncalibrated test: distance from the more-visible wrist to the vertical plane through
+    the shoulder line. Proxy for “hand vs torso / back-wall” reach, not a real wall range
+    without calibration. Uses pose_world_landmarks (approx. meters).
     """
-    global _burst_pose
     try:
-        import mediapipe as mp  # type: ignore
-    except Exception:
-        return None
-    try:
-        with _burst_pose_lock:
-            if _burst_pose is None:
-                _burst_pose = mp.solutions.pose.Pose(
-                    static_image_mode=False,
-                    model_complexity=1,
-                    enable_segmentation=False,
-                    smooth_landmarks=True,
-                    min_detection_confidence=0.5,
-                    min_tracking_confidence=0.5,
-                )
-            res = _burst_pose.process(rgb)
-        if not res.pose_world_landmarks or not res.pose_landmarks:
+        if res is None or not res.pose_world_landmarks or not res.pose_landmarks:
             return None
         wl = res.pose_world_landmarks.landmark
         pl = res.pose_landmarks.landmark
@@ -1203,6 +1186,30 @@ def _hand_to_torso_plane_m_from_rgb(rgb: np.ndarray) -> float | None:
         vis_r = float(pl[16].visibility)
         wrist = W(16) if vis_r >= vis_l else W(15)
         return abs(float(np.dot(wrist - mid, n)))
+    except Exception:
+        return None
+
+
+def _hand_to_torso_plane_m_from_rgb(rgb: np.ndarray) -> float | None:
+    """Streaming pose on live RGB (burst WebRTC). See _hand_plane_distance_m_from_pose_result."""
+    global _burst_pose
+    try:
+        import mediapipe as mp  # type: ignore
+    except Exception:
+        return None
+    try:
+        with _burst_pose_lock:
+            if _burst_pose is None:
+                _burst_pose = mp.solutions.pose.Pose(
+                    static_image_mode=False,
+                    model_complexity=1,
+                    enable_segmentation=False,
+                    smooth_landmarks=True,
+                    min_detection_confidence=0.5,
+                    min_tracking_confidence=0.5,
+                )
+            res = _burst_pose.process(rgb)
+        return _hand_plane_distance_m_from_pose_result(res)
     except Exception:
         return None
 
@@ -1334,13 +1341,18 @@ def _pil_from_data_url(data_url: str) -> Image.Image | None:
         return None
 
 
-def _pose_landmarks_from_pil(img: Image.Image) -> dict | None:
-    """Return mediapipe pose landmarks as dict{name:(x,y,vis)} in normalized image coords."""
+def _pose_landmarks_and_hand_plane_from_pil(
+    img: Image.Image,
+) -> tuple[dict | None, float | None]:
+    """
+    Single static pose pass: 2D landmarks for posture UI plus hand–torso plane distance (m)
+    when world landmarks exist.
+    """
     try:
         import cv2  # type: ignore
         import mediapipe as mp  # type: ignore
     except Exception:
-        return None
+        return None, None
     try:
         arr = np.array(img)
         bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
@@ -1352,13 +1364,19 @@ def _pose_landmarks_from_pil(img: Image.Image) -> dict | None:
         ) as pose:
             res = pose.process(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
         if not res.pose_landmarks:
-            return None
+            return None, _hand_plane_distance_m_from_pose_result(res)
         out: dict[str, tuple[float, float, float]] = {}
         for idx, lm in enumerate(res.pose_landmarks.landmark):
             out[str(idx)] = (float(lm.x), float(lm.y), float(lm.visibility))
-        return out
+        return out, _hand_plane_distance_m_from_pose_result(res)
     except Exception:
-        return None
+        return None, None
+
+
+def _pose_landmarks_from_pil(img: Image.Image) -> dict | None:
+    """Return mediapipe pose landmarks as dict{name:(x,y,vis)} in normalized image coords."""
+    lm, _ = _pose_landmarks_and_hand_plane_from_pil(img)
+    return lm
 
 
 def _angle_deg(a, b, c) -> float | None:
@@ -3026,7 +3044,7 @@ def _render_active_session(active_sheet: str) -> None:
                 if img is None:
                     st.caption("Couldn’t read the captured image.")
                 else:
-                    lm = _pose_landmarks_from_pil(img)
+                    lm, d_still = _pose_landmarks_and_hand_plane_from_pil(img)
                     if lm is None:
                         st.caption(
                             "Pose model unavailable or no person detected. "
@@ -3035,6 +3053,22 @@ def _render_active_session(active_sheet: str) -> None:
                     else:
                         for line in _posture_feedback_from_landmarks(lm):
                             st.markdown(line)
+                    st.write("##### Distance test (still)")
+                    if isinstance(d_still, (int, float)) and float(d_still) > 0.0:
+                        st.metric(
+                            "Hand ↔ torso plane (wall proxy)",
+                            f"{float(d_still) * 100.0:.1f} cm",
+                            help="Uncalibrated MediaPipe estimate: wrist vs vertical plane through your shoulders. "
+                            "Not true distance to a wall without calibration.",
+                        )
+                        st.caption(
+                            "Test only: treating the shoulder plane as a rough stand-in for “behind you.” "
+                            "Real back-wall distance needs a calibrated scene."
+                        )
+                    else:
+                        st.caption(
+                            "Distance needs a detected pose with full body visible (same as posture above)."
+                        )
 
     shot_mode = st.radio(
         "Shot type",
